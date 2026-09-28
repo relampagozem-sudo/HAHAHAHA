@@ -1,14 +1,559 @@
+--[[
+    ETW Pro 2.1 — RECONSTRUÇÃO PARCIAL V32
+    Data: 24/09/2026
+
+    NÃO é a fonte original exata. Este arquivo recompõe somente trechos que já
+    aparecem com semântica suficientemente clara no bytecode interno de 271 protótipos.
+    Regiões ainda embaralhadas permanecem marcadas como TODO.
+
+    Evidência estrutural da camada:
+      - 1521 constantes
+      - 271 protótipos
+      - 27.862 instruções virtuais
+      - root = 214
+      - desserialização consumiu o buffer inteiro (0 bytes sobrando)
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local PhysicsService = game:GetService("PhysicsService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local StarterGui = game:GetService("StarterGui")
+
+local LocalPlayer = Players.LocalPlayer
+local VirtualUser = game:GetService("VirtualUser")
+LocalPlayer.Idled:Connect(function()
+    pcall(function()
+        local camera = workspace.CurrentCamera
+        if not camera then return end
+        VirtualUser:Button2Down(Vector2.new(0, 0), camera.CFrame)
+        task.wait(1)
+        VirtualUser:Button2Up(Vector2.new(0, 0), camera.CFrame)
+    end)
+end)
+local Events = ReplicatedStorage:WaitForChild("Events")
+
+-- Remotes vistos diretamente no bytecode.
+local PurchaseEvent = Events:FindFirstChild("PurchaseEvent")
+local RequestTeleport = Events:FindFirstChild("RequestTeleport")
+local RewardEvent = Events:FindFirstChild("RewardEvent")
+local SetCubes = Events:FindFirstChild("SetCubes")
+
+local SCRIPT_TITLE = "ETW Pro 2.1"
+local CONFIG_FILE = "chichi_auto_upgrade_config.json"
+
+-- Estado do detector de mapas, linhas-fonte ~922–927.
+local mapDetect = {
+    delaySeconds = 10,
+    countdownRunning = false,
+    bootMonitorRunning = false,
+    lastMapName = "",
+    lastHitTime = 0,
+}
+
+-- Valores locais iniciais, linhas ~930–936.
+local teleportMinutes = 240
+local teleportPosX = -260
+local teleportPosZ = 800
+local idlePosX = 260
+local idlePosZ = 400
+
+-- Estado de rodadas, linhas ~941–948.
+local roundState = {
+    enabled = false,
+    count = 0,
+    target = 15,
+    pauseTriggered = false,
+    pauseRemaining = 5432,
+    wasInSmall = false,
+    megaMarked = false,
+}
+
+-- Celulas R58/R59 compartilhadas pelo pulo de mapa e pela reentrada.
+-- Os nomes originais nao sobreviveram; os valores e a ordem sao exatos.
+local skipState58 = false
+local skipState59 = false
+
+-- Proto133 U37/R42 seleciona a trajetória. Não foi encontrada escrita `true`
+-- no fluxo principal; portanto o estado inicial confirmado é posição fixa.
+local circularMovementRecovered = false
+local specialFarmPositionRuntime = {
+    mapName = "",
+    x = nil,
+    z = nil,
+}
+local ROBLOXIA_CITY_FARM_POSITION = Vector3.new(666.5, 92.7, 481.6)
+
+-- Configuração persistida, linhas ~952–977.
+local config = {
+    autoUpgradeSize = false,
+    autoUpgradeSpd = false,
+    autoUpgradeMulti = false,
+    autoUpgradeEat = false,
+    autoUpgradeNeedAffordCheck = true,
+    upgradeSectionFolded = true,
+
+    teleportMinutes = 240,
+    teleportPosX = -260,
+    teleportPosZ = 800,
+    idlePosX = 260,
+    idlePosZ = 400,
+
+    skipMaps = {},
+    customSkipMaps = {},
+    mapDetectSectionFolded = true,
+
+    smallRecognizeMaps = {},
+    smallRecognizeEnabled = false,
+    smallRecognizeDelaySeconds = 10,
+    smallCustomRecognizeMaps = {},
+
+    roundControlEnabled = true,
+    roundTarget = 15,
+    roundCount = 0,
+    roundSectionFolded = false,
+
+    timedTeleportEnabled = false,
+    stuckRespawnEnabled = true,
+    stuckRespawnSeconds = 60,
+}
+
+-- Persistência tolerante aos executores: Delta/Xeno podem expor APIs de
+-- arquivo diferentes. Se elas não existirem, o script continua normalmente.
+local function saveConfigRecovered()
+    if type(writefile) ~= "function" then return false end
+    local ok = pcall(function()
+        writefile(CONFIG_FILE, HttpService:JSONEncode(config))
+    end)
+    return ok
+end
+
+local function loadConfigRecovered()
+    if type(readfile) ~= "function" then return false end
+    local ok, decoded = pcall(function()
+        return HttpService:JSONDecode(readfile(CONFIG_FILE))
+    end)
+    if not ok or type(decoded) ~= "table" then return false end
+
+    for key, defaultValue in pairs(config) do
+        local loadedValue = decoded[key]
+        if loadedValue ~= nil and type(loadedValue) == type(defaultValue) then
+            config[key] = loadedValue
+        end
+    end
+    return true
+end
+
+loadConfigRecovered()
+-- O jogo pode fornecer o nome interno em inglês ou o texto localizado em
+-- português. As duas formas representam o mesmo mapa que deve ser ignorado.
+config.skipMaps = type(config.skipMaps) == "table" and config.skipMaps or {}
+config.skipMaps["Block Town"] = true
+config.skipMaps["Cidade do Bloco"] = true
+config.skipMaps["Robloxia Central"] = true
+config.skipMaps["Central Robloxia"] = true
+config.skipMaps["Middle Robloxia"] = true
+config.skipMaps["Studville"] = true
+teleportMinutes = tonumber(config.teleportMinutes) or teleportMinutes
+teleportPosX = tonumber(config.teleportPosX) or teleportPosX
+teleportPosZ = tonumber(config.teleportPosZ) or teleportPosZ
+idlePosX = tonumber(config.idlePosX) or idlePosX
+idlePosZ = tonumber(config.idlePosZ) or idlePosZ
+roundState.enabled = config.roundControlEnabled and true or false
+roundState.target = math.max(1, math.floor(tonumber(config.roundTarget) or roundState.target))
+roundState.count = math.max(0, math.floor(tonumber(config.roundCount) or 0))
+
+
+------------------------------------------------------------------------
+-- RECONHECIMENTO DE MAPAS PEQUENOS — PROTOS 1/18/136/156/161/185
+--
+-- Recuperado da camada interna. O fluxo foi simplificado para Luau normal,
+-- mas os nomes de configuração, a lista de 24 mapas, a normalização e o
+-- comparador vêm diretamente do bytecode.
+------------------------------------------------------------------------
+
+local DEFAULT_SMALL_RECOGNIZE_MAPS = {
+    "Battle Zone",
+    "Blox City",
+    "Candy Land",
+    "Castle Playground",
+    "Chaos Canyon",
+    "Christmas Coast",
+    "Community Construction",
+    "Courtyard",
+    "Crossroads",
+    "Forest Peak",
+    "Glass Houses",
+    "Grid City",
+    "Haunted Mansion",
+    "Headquarters",
+    "Jungle",
+    "Martian Madness",
+    "Mini Baseplate",
+    "Ninja Temple",
+    "Raven Rock",
+    "Snow Land",
+    "Twister",
+    "Winter Workshop",
+    "Yorick's Resting Place",
+    "Zombie Town",
+}
+
+local recognizedSmallMapCache = {}
+
+-- Proto 136, linhas ~2319–2321.
+local function normalizeMapNameRecovered(value)
+    local normalized = string.lower(tostring(value))
+    normalized = normalized:gsub("^%s+", "")
+    normalized = normalized:gsub("%s+$", "")
+    normalized = normalized:gsub("[%p%s_%-]", "")
+    return normalized
+end
+
+-- Proto 185, linhas ~2315–2329.
+-- Há duas chamadas :find(..., 1, true), uma em cada direção.
+local function mapNameMatchesRecovered(a, b)
+    if a == nil or b == nil then
+        return false
+    end
+
+    local left = normalizeMapNameRecovered(a)
+    local right = normalizeMapNameRecovered(b)
+
+    if left == "" or right == "" then
+        return false
+    end
+
+    if left == right then
+        return true
+    end
+
+    return left:find(right, 1, true) ~= nil
+        or right:find(left, 1, true) ~= nil
+end
+
+local function isRobloxiaCityFarmMapRecovered(mapName)
+    return mapNameMatchesRecovered(mapName, "Cidade de Robloxia")
+        or mapNameMatchesRecovered(mapName, "Robloxia City")
+end
+
+-- Proto 1, linhas ~1092–1104.
+local function buildSmallMapListRecovered()
+    local result = {}
+    local seen = {}
+
+    for _, mapName in ipairs(DEFAULT_SMALL_RECOGNIZE_MAPS) do
+        table.insert(result, mapName)
+        seen[mapName] = true
+    end
+
+    for _, mapName in ipairs(config.smallCustomRecognizeMaps or {}) do
+        if type(mapName) == "string"
+            and mapName ~= ""
+            and not seen[mapName]
+        then
+            table.insert(result, mapName)
+            seen[mapName] = true
+        end
+    end
+
+    return result
+end
+
+-- Proto 18, linhas ~1110–1133.
+-- O original preserva escolhas já existentes e acrescenta novos nomes com
+-- valor true. Depois reconstrói um cache contendo somente os nomes habilitados.
+local function refreshSmallMapRecognitionRecovered(saveConfigFn)
+    if type(config.smallRecognizeMaps) ~= "table" then
+        config.smallRecognizeMaps = {}
+    end
+    if type(config.smallCustomRecognizeMaps) ~= "table" then
+        config.smallCustomRecognizeMaps = {}
+    end
+
+    local changed = false
+
+    for _, mapName in ipairs(DEFAULT_SMALL_RECOGNIZE_MAPS) do
+        if config.smallRecognizeMaps[mapName] == nil then
+            config.smallRecognizeMaps[mapName] = true
+            changed = true
+        end
+    end
+
+    for _, mapName in ipairs(config.smallCustomRecognizeMaps) do
+        if type(mapName) == "string" and mapName ~= "" then
+            if config.smallRecognizeMaps[mapName] == nil then
+                config.smallRecognizeMaps[mapName] = true
+                changed = true
+            end
+        end
+    end
+
+    if changed and saveConfigFn then
+        pcall(saveConfigFn)
+    end
+
+    for key in pairs(recognizedSmallMapCache) do
+        recognizedSmallMapCache[key] = nil
+    end
+
+    for _, mapName in ipairs(buildSmallMapListRecovered()) do
+        if config.smallRecognizeMaps[mapName] == true then
+            recognizedSmallMapCache[mapName] = true
+        end
+    end
+
+    return changed
+end
+
+-- Proto 161 é um helper de cache sem argumentos. O bytecode percorre
+-- pairs(cache) e retorna true quando há uma entrada ativa.
+local function hasEnabledSmallMapRecognitionRecovered()
+    for _, enabled in pairs(recognizedSmallMapCache) do
+        if enabled then
+            return true
+        end
+    end
+    return false
+end
+
+-- Proto 156, linhas ~2342–2350: percorre o cache, aplica proto185 e retorna
+-- true no primeiro nome compatível.
+local function isRecognizedSmallMapByNameRecovered(mapName)
+    if mapName == nil or tostring(mapName) == "" then
+        return false
+    end
+
+    for cachedName, enabled in pairs(recognizedSmallMapCache) do
+        if enabled and mapNameMatchesRecovered(mapName, cachedName) then
+            return true
+        end
+    end
+
+    return false
+end
+
+-- A inicialização original chama o proto18 uma vez logo após criar esses
+-- helpers. Aqui fazemos a mesma preparação sem gravar arquivo ainda.
+refreshSmallMapRecognitionRecovered(nil)
+
+
+
+
+------------------------------------------------------------------------
+-- HELPERS DE MAPA / NOTIFICAÇÃO — PROTOS 24/31/50/85
+------------------------------------------------------------------------
+
+-- Proto 31, chamado pelo proto85.
+local function notifyDialogRecovered(title, message, duration)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = title,
+            Text = message,
+            Duration = duration or 3,
+        })
+    end)
+end
+
+-- Proto 24, linhas-fonte ~1606–1613.
+local function getCurrentMapNameRecovered()
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then return "" end
+
+    local screenGui = playerGui:FindFirstChild("ScreenGui")
+    if not screenGui then return "" end
+
+    local mapCountdown = screenGui:FindFirstChild("MapCountdown")
+    if not mapCountdown then return "" end
+
+    local mapName = mapCountdown:FindFirstChild("MapName")
+    if mapName and mapName.Text then
+        return tostring(mapName.Text)
+    end
+
+    return ""
+end
+
+-- Proto 50: força a troca do mapa atual.
+local function forceSwitchMapRecovered()
+    local remote = Events:FindFirstChild("SetServerSettings")
+    if not remote then
+        return false
+    end
+
+    remote:FireServer({
+        MapTime = -1,
+        Paused = true,
+    })
+
+    return true
+end
+
+
+------------------------------------------------------------------------
+-- WHITELIST / AUTORIZAÇÃO REMOTA — RECONSTRUÇÃO DO PROTO 86
+------------------------------------------------------------------------
+
+-- Configuração recuperada diretamente das linhas-fonte ~404–417.
+local WHITELIST_CONFIG = {
+    -- Lista local editável. Use o UserId numérico ou o Name exato da conta.
+    -- Essas entradas são verificadas antes das fontes remotas recuperadas.
+    LOCAL_USER_IDS = {
+        -- [123456789] = true,
+    },
+    LOCAL_USERNAMES = {
+        ["ygorchunaibo"] = true,
+        ["arthurzinho011"] = true,
+        ["marajaci08"] = true,
+        ["GOOD_MACR0"] = true,
+        ["ZLOYDE_ORG"] = true,
+        ["VILAO_UF"] = true,
+        ["CursedSwaan"] = true,
+
+        -- ["OutroUsuario"] = true,
+    },
+
+    GITHUB_URLS = {
+        "https://pastefy.app/svkr4uhC/raw",
+        "https://pastefy.app/QQTo6U7w/raw",
+    },
+    BACKUP_URL = "https://gitee.com/wyp887758/weidada/raw/master/Whitelist.json",
+    TIMEOUT = 10,
+    ENABLE_CACHE = true,
+    CACHE_DURATION = 500,
+
+    PERMISSION_URLS = {
+        ["https://pastefy.app/buljH9rz/raw"] = "看你妹",
+        ["https://pastefy.app/0mYCANjh/raw"] = "看你大爷",
+    },
+
+    ID_GITHUB_URL = "https://pastefy.app/oRz23Q8F/raw",
+    ID_BACKUP_URL = "",
+}
+
+local function trimRecovered(s)
+    if type(s) ~= "string" then return s end
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- Proto 12: baixa o conteúdo e tenta interpretar .lua/.json.
+-- A ordem exata dos fallbacks ainda está sendo validada, mas HttpGet,
+-- loadstring e HttpService:JSONDecode aparecem diretamente no bytecode.
+local function loadWhitelistDocument(url)
+    if type(url) ~= "string" or url == "" then return nil end
+
+    local ok, body = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if not ok or type(body) ~= "string" then return nil end
+
+    local lower = string.lower(url)
+    if string.find(lower, "%.lua") then
+        local okLua, result = pcall(function()
+            local fn = loadstring(body)
+            if not fn then error("Não foi possível interpretar o código Lua") end
+            return fn()
+        end)
+        if okLua then return result end
+    end
+
+    if string.find(lower, "%.json") then
+        local okJson, result = pcall(function()
+            return HttpService:JSONDecode(body)
+        end)
+        if okJson then return result end
+    end
+
+    -- O original possui fallbacks para conteúdo sem extensão reconhecida.
+    local okLua, luaResult = pcall(function()
+        local fn = loadstring(body)
+        return fn and fn()
+    end)
+    if okLua and luaResult ~= nil then return luaResult end
+
+    local okJson, jsonResult = pcall(function()
+        return HttpService:JSONDecode(body)
+    end)
+    if okJson then return jsonResult end
+
+    return nil
+end
+
+-- Proto 45: monta a lista de fontes de whitelist por nome.
+local function buildWhitelistUrlsRecovered()
+    local urls = {}
+    if type(WHITELIST_CONFIG.GITHUB_URLS) == "table" then
+        for _, url in ipairs(WHITELIST_CONFIG.GITHUB_URLS) do
+            if type(url) == "string" then
+                table.insert(urls, url)
+            end
+        end
+    end
+    if type(WHITELIST_CONFIG.GITHUB_URL) == "string" then
+        table.insert(urls, WHITELIST_CONFIG.GITHUB_URL)
+    end
+    return urls
+end
+
+-- Proto 19 captura LocalPlayer.Name e LocalPlayer.DisplayName.
+-- Não há pairs/ipairs dentro desse protótipo: ele faz acesso direto à tabela
+-- `usernames`, portanto o formato recuperado é um mapa/dicionário.
+local function usernameAuthorizedRecovered(data, username, displayName)
+    if type(data) ~= "table" or type(data.usernames) ~= "table" then
+        return false
+    end
+    if data.usernames[username] then return true end
+    if data.usernames[displayName] then return true end
+    return false
+end
+
+-- Linhas ~600–611 do proto 86: UserId é convertido com tostring e usado
+-- como chave direta dentro de `userIds`.
+local function userIdAuthorizedRecovered(data, userIdString)
+    return type(data) == "table"
+        and type(data.userIds) == "table"
+        and not not data.userIds[userIdString]
+end
+
+-- Proto 68 é o kill-switch remoto. A estrutura está recuperada (PERMISSION_URLS,
+-- HttpGet, trim, tonumber, comparação com os tokens), mas a ordem exata dos
+-- ramos ainda está flattenada. Por isso esta função é apenas um extrator de
+-- estado e NÃO é usada para forçar aprovação.
+local function readPermissionSwitchesRecovered()
+    local observations = {}
+    if type(WHITELIST_CONFIG.PERMISSION_URLS) ~= "table" then
+        return observations
+    end
+
+    for url, expected in pairs(WHITELIST_CONFIG.PERMISSION_URLS) do
+        if type(url) == "string" then
+            local ok, body = pcall(function() return game:HttpGet(url) end)
+            local value = ok and type(body) == "string" and trimRecovered(body) or nil
+            table.insert(observations, {
+                url = url,
+                expected = expected,
+                value = value,
+                numeric = value and tonumber(value) or nil,
+                matchesExpected = value == expected,
+            })
         end
     end
     return observations
 end
+
+-- Reconstrução do núcleo verificável do proto 86. O kill-switch do proto 68
+-- ainda é mantido separado até a direção exata de todos os ramos ser confirmada.
 local function checkWhitelistRecovered()
     local player = Players.LocalPlayer
     if not player then
         return false, "Não foi possível obter as informações do jogador"
     end
+
     local username = player.Name
     local displayName = player.DisplayName
+
     if type(WHITELIST_CONFIG.LOCAL_USER_IDS) == "table"
         and WHITELIST_CONFIG.LOCAL_USER_IDS[player.UserId]
     then
@@ -19,12 +564,14 @@ local function checkWhitelistRecovered()
     then
         return true, " "
     end
+
     for _, url in ipairs(buildWhitelistUrlsRecovered()) do
         local data = loadWhitelistDocument(url)
         if usernameAuthorizedRecovered(data, username, displayName) then
             return true, " "
         end
     end
+
     local userId = tostring(player.UserId)
     local idUrls = {
         WHITELIST_CONFIG.ID_GITHUB_URL,
@@ -38,16 +585,27 @@ local function checkWhitelistRecovered()
             end
         end
     end
+
     return false, [[Aviso:
 O uso deste script é de sua responsabilidade.
+
 Você não está na lista de autorização e não pode usar este script.
 Ao solicitar autorização, você aceita estes termos.]]
 end
+
+------------------------------------------------------------------------
+-- AUTO UPGRADE
+------------------------------------------------------------------------
+
+-- O bytecode resolve os labels de preço por esta hierarquia (proto 9):
+-- PlayerGui > ScreenGui > Shop > ShopFrames > Upgrades > UpgradeList
+-- > [MaxSize|Speed|EatSpeed|Multiplier] > BuyFrame > Price
 local function getUpgradePriceObject(upgradeName)
     local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
     if not playerGui then return nil end
     local screenGui = playerGui:FindFirstChild("ScreenGui")
     if not screenGui then return nil end
+
     local shop = screenGui:FindFirstChild("Shop")
     local shopFrames = shop and shop:FindFirstChild("ShopFrames")
     local upgrades = shopFrames and shopFrames:FindFirstChild("Upgrades")
@@ -56,10 +614,13 @@ local function getUpgradePriceObject(upgradeName)
     local buyFrame = row and row:FindFirstChild("BuyFrame")
     return buyFrame and buyFrame:FindFirstChild("Price")
 end
+
+-- Protos 7/121: parser compartilhado pelo saldo e pelos preços da loja.
 local function parseDisplayedNumberRecovered(textObject)
     if not textObject then return 0 end
     local text = tostring(textObject.Text or "")
     if text == "" then return 0 end
+
     text = text:gsub(",", ""):gsub("%s+", "")
     local lowered = string.lower(text)
     local multiplier = 1
@@ -74,9 +635,12 @@ local function parseDisplayedNumberRecovered(textObject)
     elseif text:find("亿", 1, true) then
         multiplier = 100000000
     end
+
     local number = tonumber(text:gsub("[^%d%.]", "")) or 0
     return math.floor(number * multiplier)
 end
+
+-- Proto121: saldo no primeiro TextLabel de Shop/CubeFrame/CounterFrame.
 local function getUpgradeBalanceObjectRecovered()
     local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
     local screenGui = playerGui and playerGui:FindFirstChild("ScreenGui")
@@ -85,6 +649,8 @@ local function getUpgradeBalanceObjectRecovered()
     local counter = cubeFrame and cubeFrame:FindFirstChild("CounterFrame")
     return counter and counter:FindFirstChildOfClass("TextLabel") or nil
 end
+
+-- Proto127: quando a checagem está ligada, só compra com saldo e preço válidos.
 local function canAffordUpgradeRecovered(upgradeName)
     if not config.autoUpgradeNeedAffordCheck then return true end
     local balance = parseDisplayedNumberRecovered(getUpgradeBalanceObjectRecovered())
@@ -92,6 +658,7 @@ local function canAffordUpgradeRecovered(upgradeName)
     if balance <= 0 or price <= 0 then return false end
     return balance >= price
 end
+
 local function disablePurchasePromptIfPresent(container)
     if not container then return end
     local prompt = container:FindFirstChild("PurchasePromptApp")
@@ -99,30 +666,40 @@ local function disablePurchasePromptIfPresent(container)
         prompt.Enabled = false
     end
 end
+
+-- Proto 194, linhas ~2494–2499.
 local function purchaseMaxSize(container)
     disablePurchasePromptIfPresent(container)
     if PurchaseEvent and canAffordUpgradeRecovered("MaxSize") then
         PurchaseEvent:FireServer("MaxSize")
     end
 end
+
+-- Proto 204, linhas ~2425–2430.
 local function purchaseMultiplier(container)
     disablePurchasePromptIfPresent(container)
     if PurchaseEvent and canAffordUpgradeRecovered("Multiplier") then
         PurchaseEvent:FireServer("Multiplier")
     end
 end
+
+-- Proto 237, linhas ~2448–2453.
 local function purchaseSpeed(container)
     disablePurchasePromptIfPresent(container)
     if PurchaseEvent and canAffordUpgradeRecovered("Speed") then
         PurchaseEvent:FireServer("Speed")
     end
 end
+
+-- Proto 263, linhas ~2471–2476.
 local function purchaseEatSpeed(container)
     disablePurchasePromptIfPresent(container)
     if PurchaseEvent and canAffordUpgradeRecovered("EatSpeed") then
         PurchaseEvent:FireServer("EatSpeed")
     end
 end
+
+-- Os quatro loops esperam 5 s com verificação de saldo e 2 s sem ela.
 local function autoUpgradeLoop(flagName, purchaseFn, container)
     task.spawn(function()
         while config[flagName] do
@@ -131,51 +708,70 @@ local function autoUpgradeLoop(flagName, purchaseFn, container)
         end
     end)
 end
+
 local function setAutoUpgradeSize(enabled, container)
     config.autoUpgradeSize = enabled
     saveConfigRecovered()
     if enabled then autoUpgradeLoop("autoUpgradeSize", purchaseMaxSize, container) end
 end
+
 local function setAutoUpgradeMultiplier(enabled, container)
     config.autoUpgradeMulti = enabled
     saveConfigRecovered()
     if enabled then autoUpgradeLoop("autoUpgradeMulti", purchaseMultiplier, container) end
 end
+
 local function setAutoUpgradeSpeed(enabled, container)
     config.autoUpgradeSpd = enabled
     saveConfigRecovered()
     if enabled then autoUpgradeLoop("autoUpgradeSpd", purchaseSpeed, container) end
 end
+
 local function setAutoUpgradeEatSpeed(enabled, container)
     config.autoUpgradeEat = enabled
     saveConfigRecovered()
     if enabled then autoUpgradeLoop("autoUpgradeEat", purchaseEatSpeed, container) end
 end
+
 local function setAffordabilityCheck(enabled)
     config.autoUpgradeNeedAffordCheck = enabled
     saveConfigRecovered()
+    -- O parser da moeda/preço ainda está sendo reconstruído.
 end
+
+------------------------------------------------------------------------
+-- RODADAS
+------------------------------------------------------------------------
+
 local function syncRoundConfig()
     config.roundControlEnabled = roundState.enabled
     config.roundTarget = roundState.target
     config.roundCount = roundState.count
     saveConfigRecovered()
 end
+
+-- Proto 210, linhas ~3809–3825.
 local function markEnterMega()
     if not roundState.enabled then return false end
     if roundState.megaMarked then return false end
+
+    -- Proto 210 marca a entrada para impedir dupla contagem.
     roundState.megaMarked = true
     roundState.wasInSmall = false
     roundState.count += 1
     roundState.pauseTriggered = false
     config.roundCount = roundState.count
     saveConfigRecovered()
+
     if roundState.refreshUI then
         pcall(roundState.refreshUI)
     end
+
     print("Contagem de rodadas: entrada no mapa grande, rodada " .. tostring(roundState.count) .. "")
     return true
 end
+
+-- Proto 230/257: reset confirmado.
 local function clearRoundCount()
     roundState.count = 0
     roundState.pauseTriggered = false
@@ -185,8 +781,2752 @@ local function clearRoundCount()
     saveConfigRecovered()
     print("Contagem de rodadas zerada")
 end
+
 local function setRoundTarget(value)
     value = math.floor(tonumber(value) or 0)
     if value <= 0 then
         return false, "Meta de rodadas inválida; informe um número inteiro maior que zero"
     end
+    roundState.target = value
+    roundState.pauseTriggered = false
+    config.roundTarget = value
+    saveConfigRecovered()
+    return true
+end
+
+local function setRoundControl(enabled)
+    roundState.enabled = enabled
+    config.roundControlEnabled = enabled
+    saveConfigRecovered()
+end
+
+local setSmartTeleportRecovered
+
+-- Proto 269. A pausa ocorre quando count >= target e o countdown do Mega
+-- chega ao pauseRemaining (5432). O prototipo chama o setter real com false.
+local function shouldPauseSmartTeleport(countdownState, remainingTime)
+    if not roundState.enabled or roundState.pauseTriggered then return false end
+    if roundState.count < roundState.target then return false end
+    if countdownState ~= "Mega" then return false end
+    if remainingTime > roundState.pauseRemaining then return false end
+
+    roundState.pauseTriggered = true
+    return true
+end
+
+------------------------------------------------------------------------
+-- TELEPORTE INTELIGENTE — PROTO 153/157/175/179/233/234 (V2)
+--
+-- Esta versão foi relida em ordem de linha-fonte. Partes confirmadas pelo
+-- bytecode são mantidas diretamente; auxiliares cujo nome exato ainda não
+-- foi recuperado entram como callbacks em `args`, em vez de serem inventados.
+------------------------------------------------------------------------
+
+local function requestMega()
+    if RequestTeleport then
+        RequestTeleport:FireServer("Mega")
+    end
+end
+
+-- Fases da saida do Mega:
+--   "draining": bloqueia Grab, mas mantém Eat para terminar o bloco atual.
+--   "selling": bloqueia Grab e Eat enquanto vende e confirma o resultado.
+local sellTransitionPhaseRecovered = nil
+
+-- Protecao central do retorno: o mapa Normal so e solicitado depois que o
+-- servidor confirmar a venda pela reducao de Character.Size.
+local function sellBeforeNormalRecovered()
+    if sellTransitionPhaseRecovered then
+        return false
+    end
+
+    sellTransitionPhaseRecovered = "draining"
+
+    local character = LocalPlayer.Character
+    local charEvents = character and character:FindFirstChild("Events")
+    local sell = charEvents and charEvents:FindFirstChild("Sell")
+    local sizeValue = character and character:FindFirstChild("Size")
+    local currentChunk = character and character:FindFirstChild("CurrentChunk")
+
+    if not sell and Events then
+        sell = Events:FindFirstChild("Sell")
+    end
+
+    if not sell or not sizeValue then
+        warn("[ETW V32] Sell ou Size nao encontrado antes do retorno ao mapa normal")
+        sellTransitionPhaseRecovered = nil
+        return false
+    end
+
+    local sizeBefore = tonumber(sizeValue.Value) or 0
+    if sizeBefore <= 0 then
+        sellTransitionPhaseRecovered = nil
+        return true
+    end
+
+    -- Nao pega outro bloco, mas continua enviando Eat ate o bloco que ja estava
+    -- em andamento terminar. Depois de CurrentChunk livre, bloqueia Eat também.
+    local drainDeadline = tick() + 25
+    local idleSince = nil
+
+    while tick() < drainDeadline do
+        if not character.Parent or not sizeValue.Parent then
+            sellTransitionPhaseRecovered = nil
+            return false
+        end
+
+        local chunkActive = false
+        if currentChunk and currentChunk.Parent then
+            local readOk, value = pcall(function()
+                return currentChunk.Value
+            end)
+            chunkActive = readOk and value and true or false
+        end
+
+        if chunkActive then
+            idleSince = nil
+        else
+            idleSince = idleSince or tick()
+            if tick() - idleSince >= 0.75 then
+                break
+            end
+        end
+
+        task.wait(0.1)
+    end
+
+    if not idleSince or tick() - idleSince < 0.75 then
+        warn("[ETW V32] Coleta nao terminou; venda e retorno adiados")
+        sellTransitionPhaseRecovered = nil
+        return false
+    end
+
+    sellTransitionPhaseRecovered = "selling"
+    task.wait(0.25)
+
+    local deadline = tick() + 8
+    local nextAttempt = 0
+
+    while tick() < deadline do
+        if not character.Parent or not sizeValue.Parent then
+            sellTransitionPhaseRecovered = nil
+            return false
+        end
+
+        local currentSize = tonumber(sizeValue.Value) or sizeBefore
+        if currentSize < sizeBefore then
+            -- Uma pausa curta evita que o teleporte dispute o mesmo frame da
+            -- atualizacao de saldo/tamanho recebida do servidor.
+            task.wait(0.35)
+            sellTransitionPhaseRecovered = nil
+            return true
+        end
+
+        if tick() >= nextAttempt then
+            local ok, err = pcall(function()
+                sell:FireServer()
+            end)
+            if not ok then
+                warn("[ETW V32] Falha ao vender antes do retorno: " .. tostring(err))
+            end
+            nextAttempt = tick() + 1
+        end
+
+        task.wait(0.1)
+    end
+
+    warn("[ETW V32] Venda nao confirmada; retorno ao mapa normal cancelado")
+    sellTransitionPhaseRecovered = nil
+    return false
+end
+
+local function requestNormal()
+    if not sellBeforeNormalRecovered() then return false end
+    if not RequestTeleport then return false end
+
+    RequestTeleport:FireServer("Normal")
+    return true
+end
+
+-- Proto 153, linhas-fonte ~4234–4238.
+local function characterTeleportToMega()
+    local character = LocalPlayer.Character
+    if not character then return false end
+
+    local charEvents = character:FindFirstChild("Events")
+    local remote = charEvents and charEvents:FindFirstChild("TeleportToMegaMap")
+    if not remote then return false end
+
+    remote:FireServer()
+    return true
+end
+
+-- Proto 234, linha-fonte ~4145.
+local function setCubesRecovered()
+    local replicatedStorage = game:GetService("ReplicatedStorage")
+    local remote = replicatedStorage
+        :WaitForChild("Events")
+        :WaitForChild("SetCubes")
+
+    remote:FireServer()
+end
+
+local MEGA_COUNTDOWN_SECONDS = 5500
+local SMALL_COUNTDOWN_SECONDS = 10
+local TELEPORT_TIMEOUT_SECONDS = 20
+local SELL_PREP_SECONDS = 15
+local SELL_TRIGGER_SECONDS = 5
+local LANDING_TIMEOUT_SECONDS = 5
+local MAP_REPEAT_GUARD_SECONDS = 15
+local SKIP_REPEAT_GUARD_SECONDS = 5
+
+-- Proto133 U20/U27: contador global de blocos e último estado observado.
+-- O bytecode incrementa somente na borda false -> true de CurrentChunk.Value.
+local chunkRuntimeRecovered = {
+    total = 0,
+    previousActive = false,
+    noChunkSeconds = 0,
+    sellDebounce = false,
+}
+
+local teleportRuntime = {
+    lastClock = nil,
+    teleportIssuedAt = nil,
+
+    sellFlowStarted = false,
+    autoStateSaved = false,
+    savedAutoFlags = nil,
+
+    -- Proto 153, linhas ~4142–4144 / ~4155.
+    lastMapName = nil,
+    lastMapActionAt = 0,
+    lastSkipMap = nil,
+    lastSkipAt = 0,
+}
+
+local function setTeleportCountdownState(holder, state, remaining)
+    if not holder then return end
+    holder:SetAttribute("CountdownState", state)
+    holder:SetAttribute("RemainingTime", remaining)
+end
+
+local function updateTeleportCountdownLabel(label, colors, state, remaining)
+    if not label then return end
+
+    remaining = math.max(0, tonumber(remaining) or 0)
+    local seconds = math.ceil(remaining)
+
+    if state == "Mega" then
+        if colors and colors.TextColor_MegaToSmall then
+            label.TextColor3 = colors.TextColor_MegaToSmall
+        end
+        label.Text = "Mapa grande → mapa pequeno: " .. tostring(seconds) .. " s"
+    elseif state == "Small" then
+        if colors and colors.TextColor_SmallToMega then
+            label.TextColor3 = colors.TextColor_SmallToMega
+        end
+        label.Text = "Mapa pequeno → mapa grande: " .. tostring(seconds) .. " s"
+    end
+end
+
+-- Proto 157: espera o Humanoid tocar o chão. Timeout confirmado em 5 s.
+-- O proto157 é a rotina de espera por aterrissagem usada pelo subsistema de teleporte.
+local function waitForLanding(character, notify)
+    if not character then return false end
+
+    local humanoid = character:WaitForChild("Humanoid")
+    local started = os.clock()
+
+    while humanoid.FloorMaterial == Enum.Material.Air do
+        if os.clock() - started > LANDING_TIMEOUT_SECONDS then
+            if notify then
+                notify("Tempo de espera do personagem esgotado; monitor de teleporte iniciado")
+            end
+            return false
+        end
+        task.wait(0.1)
+    end
+
+    if notify then
+        notify("Personagem no chão; monitor de teleporte iniciado")
+    end
+    return true
+end
+
+local function markRecognizedSmall(holder, label, colors, notify)
+    setTeleportCountdownState(holder, "Small", SMALL_COUNTDOWN_SECONDS)
+    roundState.wasInSmall = true
+    roundState.megaMarked = false
+    updateTeleportCountdownLabel(label, colors, "Small", SMALL_COUNTDOWN_SECONDS)
+
+    if notify then
+        notify("Mapa pequeno reconhecido; contagem de 10 s iniciada")
+    end
+end
+
+local function beginMegaCountdown(holder, label, colors)
+    setTeleportCountdownState(holder, "Mega", MEGA_COUNTDOWN_SECONDS)
+    updateTeleportCountdownLabel(label, colors, "Mega", MEGA_COUNTDOWN_SECONDS)
+end
+
+-- Proto 179 + proto 142. O fluxo externo (proto 175) espera 1 s antes e
+-- depois da tentativa principal.
+local function sellRecovered(notify)
+    local ok, err = pcall(function()
+        local character = LocalPlayer.Character
+        local charEvents = character and character:FindFirstChild("Events")
+        local sell = charEvents and charEvents:FindFirstChild("Sell")
+
+        if sell then
+            sell:FireServer()
+            return
+        end
+
+        -- O proto 179 contém uma segunda rota para o Sell.
+        local fallback = Events and Events:FindFirstChild("Sell")
+        if fallback then
+            fallback:FireServer()
+            return
+        end
+
+        error("Sell remote not found")
+    end)
+
+    if ok then
+        if notify then notify("Venda concluída") end
+        return true
+    end
+
+    if notify then
+        notify("Falha na venda: " .. tostring(err))
+    end
+
+    local backupOk = pcall(function()
+        local character = LocalPlayer.Character
+        if character
+            and character:FindFirstChild("Events")
+            and character.Events:FindFirstChild("Sell")
+        then
+            character.Events.Sell:FireServer()
+        end
+    end)
+
+    if backupOk and notify then
+        notify("Venda alternativa concluída")
+    end
+
+    return backupOk
+end
+
+-- Proto 175, linhas ~4290–4334.
+local function runSellFlow(remaining, notify)
+    if notify then
+        notify("Contagem do mapa grande: " .. tostring(math.ceil(remaining)) .. " s; iniciando venda")
+    end
+
+    task.wait(1)
+    sellRecovered(notify)
+    task.wait(1)
+
+    teleportRuntime.sellFlowStarted = false
+end
+
+-- Declarações antecipadas: o proto153 usa estas funções antes da seção em
+-- que o estado de 刷/领/收 é reconstruído. Sem isso, Luau buscaria globais.
+local getAutoFarmFlagsRecovered
+local setAutoFarmFlagsRecovered
+
+-- As três flags de auto刷/领/收 aparecem como três upvalues booleanos
+-- independentes. Os nomes individuais ainda não estão seguros.
+local function saveAutoFlags(args, notify)
+    if teleportRuntime.autoStateSaved then
+        return
+    end
+
+    local a, b, c
+    if args and args.getAutoFlags then
+        a, b, c = args.getAutoFlags()
+    else
+        a, b, c = getAutoFarmFlagsRecovered()
+    end
+
+    teleportRuntime.savedAutoFlags = {a, b, c}
+    teleportRuntime.autoStateSaved = true
+
+    if notify then
+        notify("Mapa grande em 15 s; estado do farm automático salvo")
+    end
+
+    if args and args.setAutoFlags then
+        args.setAutoFlags(false, false, false)
+    else
+        setAutoFarmFlagsRecovered(false, false, false)
+    end
+end
+
+local function restoreAutoFlags(args, notify)
+    if not teleportRuntime.autoStateSaved then
+        return
+    end
+
+    local saved = teleportRuntime.savedAutoFlags
+    if saved then
+        if args and args.setAutoFlags then
+            args.setAutoFlags(saved[1], saved[2], saved[3])
+        else
+            setAutoFarmFlagsRecovered(saved[1], saved[2], saved[3])
+        end
+    end
+
+    teleportRuntime.autoStateSaved = false
+    teleportRuntime.savedAutoFlags = nil
+
+    if notify then
+        notify("Farm, recompensas e coleta restaurados")
+    end
+end
+
+local function resetChunkState(args, notify)
+    -- Proto153 zera as células usadas como total e estado anterior.
+    chunkRuntimeRecovered.total = 0
+    chunkRuntimeRecovered.previousActive = false
+    chunkRuntimeRecovered.noChunkSeconds = 0
+
+    if args and args.resetChunkState then
+        args.resetChunkState(0, false)
+    end
+
+    if notify then
+        notify("Contagem de blocos zerada antes do teleporte")
+    end
+end
+
+local function notifyDialog(args, title, message, duration)
+    if args and args.dialog then
+        return args.dialog(title, message, duration)
+    end
+
+    return notifyDialogRecovered(title, message, duration)
+end
+
+local function getCurrentMapName(args)
+    -- V11: o getter real foi identificado como proto24. Mantemos somente
+    -- um override opcional para harnesses/testes.
+    if args and args.getMapName then
+        local ok, value = pcall(args.getMapName)
+        if ok and value ~= nil then
+            return tostring(value)
+        end
+    end
+
+    return getCurrentMapNameRecovered()
+end
+
+-- Linhas ~4140–4149. Duas funções auxiliares do original filtram quando
+-- SetCubes deve rodar. Elas continuam expostas por callback porque ainda não
+-- há nome seguro para ambas.
+local function processSetCubesRecognition(args, mapName, now, notify)
+    if not mapName or mapName == "" then
+        return
+    end
+
+    -- Linhas ~4141: o fluxo chama um helper sem argumentos e depois um
+    -- helper com mapName. Os protos 161 e 156 encaixam exatamente nessas
+    -- assinaturas e semântica: cache ativo + reconhecimento do nome.
+    local gateA
+    if args and args.canSetCubes then
+        gateA = args.canSetCubes() and true or false
+    else
+        gateA = hasEnabledSmallMapRecognitionRecovered()
+    end
+
+    local gateB
+    if args and args.shouldSetCubesForMap then
+        gateB = args.shouldSetCubesForMap(mapName) and true or false
+    else
+        gateB = isRecognizedSmallMapByNameRecovered(mapName)
+    end
+
+    if not (gateA and gateB) then
+        return
+    end
+
+    local repeatedTooSoon =
+        teleportRuntime.lastMapName == mapName
+        and (now - teleportRuntime.lastMapActionAt) <= MAP_REPEAT_GUARD_SECONDS
+
+    if repeatedTooSoon then
+        return
+    end
+
+    teleportRuntime.lastMapName = mapName
+    teleportRuntime.lastMapActionAt = now
+
+    pcall(args.setCubes or setCubesRecovered)
+
+    local message = "Mapa pequeno reconhecido: " .. mapName .. "; SetCubes executado"
+    if args.toast then
+        args.toast(message, 2.5)
+    end
+    if notify then
+        notify(message)
+    end
+end
+
+-- Linhas ~4152–4163.
+local function processSkipMap(args, mapName, now, label, notify)
+    if not mapName or mapName == "" then
+        return false
+    end
+
+    -- upvalue13 é a tabela iterada por pairs; upvalue14 é chamada como
+    -- matcher(mapName, skipEntry) nas linhas ~4153–4154.
+    local skipMaps = args.skipMaps or config.skipMaps
+    local matches = args.matchesSkipMap or mapNameMatchesRecovered
+    if type(skipMaps) ~= "table" or type(matches) ~= "function" then
+        return false
+    end
+
+    -- O original usa a chave devolvida por pairs como nome selecionado.
+    -- O valor associado nao participa da decisao.
+    for selectedMapName in pairs(skipMaps) do
+        if matches(mapName, selectedMapName) then
+            local allowed =
+                teleportRuntime.lastSkipMap ~= mapName
+                or (now - teleportRuntime.lastSkipAt) > SKIP_REPEAT_GUARD_SECONDS
+
+            if not allowed then
+                return false
+            end
+
+            teleportRuntime.lastSkipMap = mapName
+            teleportRuntime.lastSkipAt = now
+
+            if label then
+                label.Text = "Mapa marcado para pular; trocando..."
+            end
+
+            if notify then
+                notify("Mapa marcado para pular: " .. mapName .. "; iniciando troca")
+            end
+
+            notifyDialog(
+                args,
+                "Pular mapa",
+                "O mapa selecionado " .. tostring(selectedMapName) .. " foi pulado",
+                3
+            )
+
+            -- Linhas 4161-4163: R58=false, R59=true, depois proto50.
+            skipState58 = false
+            skipState59 = true
+            if args.onSkipState then
+                args.onSkipState(false, true)
+            end
+
+            if args and args.switchSkippedMap then
+                args.switchSkippedMap()
+            else
+                -- proto50 -> Events.SetServerSettings:FireServer({
+                --     MapTime = -1, Paused = true
+                -- })
+                pcall(forceSwitchMapRecovered)
+            end
+
+            return true
+        end
+    end
+
+    return false
+end
+
+local blockedFarmMapRuntime = {
+    lastMapName = "",
+    lastSwitchAt = 0,
+    mapIdentificationStartedAt = tick(),
+}
+
+local function isSkippedFarmMapRecovered(mapName)
+    if type(mapName) ~= "string" or mapName == "" then return false end
+    for selectedMapName in pairs(config.skipMaps or {}) do
+        if mapNameMatchesRecovered(mapName, selectedMapName) then
+            return true, selectedMapName
+        end
+    end
+    return false
+end
+
+-- Usado pelo próprio Heartbeat do farm. A decisão acontece antes de
+-- Grab/Eat/SendTrack, portanto nenhum objeto é consumido no mapa bloqueado.
+local function suppressFarmOnSkippedMapRecovered(statusLabel, notify)
+    local mapName = getCurrentMapNameRecovered()
+    if mapName == "" then
+        -- Evita comer nos primeiros instantes, antes de MapName aparecer.
+        if tick() - (blockedFarmMapRuntime.mapIdentificationStartedAt or tick()) < 5 then
+            if statusLabel then statusLabel.Text = "Identificando o mapa..." end
+            return true
+        end
+        return false
+    end
+    local blocked, selectedName = isSkippedFarmMapRecovered(mapName)
+    if not blocked then
+        if blockedFarmMapRuntime.lastMapName ~= "" then
+            skipState59 = false
+        end
+        blockedFarmMapRuntime.lastMapName = ""
+        return false
+    end
+
+    skipState58 = false
+    skipState59 = true
+    if statusLabel then
+        statusLabel.Text = "Mapa ignorado: " .. mapName .. "\nAguardando troca de mapa..."
+    end
+
+    local now = tick()
+    local maySwitch = blockedFarmMapRuntime.lastMapName ~= mapName
+        or (now - blockedFarmMapRuntime.lastSwitchAt) > SKIP_REPEAT_GUARD_SECONDS
+    if maySwitch then
+        blockedFarmMapRuntime.lastMapName = mapName
+        blockedFarmMapRuntime.lastSwitchAt = now
+        if notify then
+            pcall(notify, "Pulando " .. mapName .. "; o farm foi pausado neste mapa")
+        end
+        pcall(forceSwitchMapRecovered)
+    end
+    return true, selectedName
+end
+
+
+-- Proto 215 — classificador Small/Big chamado pelo proto153 na linha ~4170.
+-- Correção da V9: proto153 é criado diretamente pelo proto118 em ~4489;
+-- portanto não usamos mais a cadeia proto206→proto153 como prova de captures.
+local function classifySmallMapRecovered(chunkCount, mapName, isRecognizedSmallMapByName, debugLog)
+    chunkCount = tonumber(chunkCount) or 0
+
+    -- A própria string de diagnóstico do original confirma o limiar >= 10.
+    if chunkCount >= 10 then
+        if debugLog then
+            debugLog(
+                "[Classificação] blocos="
+                .. tostring(chunkCount)
+                .. " ≥ 10 → mapa grande"
+            )
+        end
+        return false
+    end
+
+    if mapName == nil or mapName == "" then
+        if debugLog then
+            debugLog(
+                "[Classificação] blocos="
+                .. tostring(chunkCount)
+                .. " nome desconhecido → considerado mapa grande"
+            )
+        end
+        return false
+    end
+
+    local recognizer = isRecognizedSmallMapByName
+        or isRecognizedSmallMapByNameRecovered
+
+    local isSmall = recognizer(mapName) and true or false
+
+    if debugLog then
+        debugLog(
+            "[Classificação] blocos="
+            .. tostring(chunkCount)
+            .. " nome="
+            .. tostring(mapName)
+            .. " → "
+            .. (isSmall and "mapa pequeno" or "mapa grande")
+        )
+    end
+
+    return isSmall
+end
+
+-- Proto 153 linearizado em uma iteração.
+local function smartTeleportTick(args)
+    -- A cadeia de capturas proto153 -> proto206 -> proto233 -> proto118 resolve
+    -- upvalue1 exatamente como registers[26], isto e, Players.LocalPlayer.
+    local holder = args.holder or LocalPlayer
+    local label = args.label
+    local colors = args.colors
+    local notify = args.notify
+
+    if not holder then
+        return false
+    end
+
+    local character = args.character or LocalPlayer.Character
+    if not character or not character.Parent then
+        if notify then
+            notify("Personagem ausente; teleporte pausado")
+        end
+        return false
+    end
+
+    local state = holder:GetAttribute("CountdownState")
+    local remaining = tonumber(holder:GetAttribute("RemainingTime")) or 0
+    local now = os.clock()
+
+    if teleportRuntime.lastClock == nil then
+        teleportRuntime.lastClock = now
+    end
+
+    local dt = math.max(0, now - teleportRuntime.lastClock)
+    teleportRuntime.lastClock = now
+
+    local mapName = getCurrentMapName(args)
+
+    -- Proto 234 / reconhecimento de mapa.
+    processSetCubesRecognition(args, mapName, now, notify)
+
+    -- Skip-map ocorre antes da classificação Small/Mega.
+    if processSkipMap(args, mapName, now, label, notify) then
+        return true
+    end
+
+    -- upvalue21 é o proto215: classifica Small/Big usando primeiro a
+    -- quantidade de chunks e, abaixo de 10, o reconhecimento pelo nome.
+    local chunkCount = chunkRuntimeRecovered.total
+    if args.getChunkCount then
+        local ok, value = pcall(args.getChunkCount)
+        if ok and value ~= nil then
+            chunkCount = tonumber(value) or chunkRuntimeRecovered.total
+        end
+    end
+
+    local isSmall = classifySmallMapRecovered(
+        chunkCount,
+        mapName,
+        args.isRecognizedSmallMapByName or isRecognizedSmallMapByNameRecovered,
+        args.debugMap
+    )
+
+    -- Linhas ~4175–4182: máquina de contagem de rodadas.
+    if roundState.enabled then
+        if isSmall then
+            roundState.wasInSmall = true
+            roundState.megaMarked = false
+        elseif roundState.wasInSmall
+            and not roundState.megaMarked
+            and teleportRuntime.teleportIssuedAt
+            and mapName
+            and mapName ~= ""
+        then
+            markEnterMega()
+        end
+    end
+
+    -- Linhas ~4188–4197: reconhecimento da chegada à Small.
+    if teleportRuntime.teleportIssuedAt
+        and state ~= "Small"
+        and isSmall
+    then
+        markRecognizedSmall(holder, label, colors, notify)
+        state = "Small"
+        remaining = SMALL_COUNTDOWN_SECONDS
+    end
+
+    -- Linhas ~4217–4226: watchdog quando o estado continua Small,
+    -- o mapa ainda é reconhecido como Small e o contador chegou a zero.
+    if teleportRuntime.teleportIssuedAt
+        and state == "Small"
+        and remaining <= 0
+        and isSmall
+    then
+        if notify then
+            notify("Teleporte preso no mapa pequeno; repetindo mapa grande → mapa pequeno")
+        end
+
+        notifyDialog(
+            args,
+            "Teleporte inteligente",
+            "Repetindo teleporte: mapa grande → mapa pequeno",
+            3
+        )
+
+        state = "Mega"
+        remaining = MEGA_COUNTDOWN_SECONDS
+        setTeleportCountdownState(holder, state, remaining)
+        updateTeleportCountdownLabel(label, colors, state, remaining)
+        return true
+    end
+
+    -- Linhas ~4230–4246: detecta o texto de teleporte preso.
+    -- enquanto o mapa já é reconhecido como Small, força TeleportToMegaMap.
+    if isSmall
+        and label
+        and type(label.Text) == "string"
+        and string.find(label.Text, "Teleportando para mapa pequeno", 1, true)
+    then
+        if notify then
+        notify("Teleporte travado; forçando mapa pequeno → mapa grande")
+        end
+
+        notifyDialog(
+            args,
+            "Teleporte inteligente",
+            "Teleporte travado; forçando mapa pequeno → mapa grande",
+            3
+        )
+
+        pcall(characterTeleportToMega)
+
+        state = "Mega"
+        remaining = MEGA_COUNTDOWN_SECONDS
+        setTeleportCountdownState(holder, state, remaining)
+        updateTeleportCountdownLabel(label, colors, state, remaining)
+        return true
+    end
+
+    -- Linhas ~4250–4255: o contador só é decrementado quando há estado,
+    -- timestamp de teleporte e remaining > 0.
+    if state and teleportRuntime.teleportIssuedAt and remaining > 0 then
+        remaining = math.max(0, remaining - dt)
+        holder:SetAttribute("RemainingTime", remaining)
+    end
+
+    local ceilRemaining = math.ceil(math.max(0, remaining))
+    updateTeleportCountdownLabel(label, colors, state, remaining)
+
+    -- Proto 269 é chamado pelo original somente em Mega.
+    if state == "Mega"
+        and shouldPauseSmartTeleport(state, ceilRemaining)
+    then
+        if args.setSmartTeleportEnabled then
+            args.setSmartTeleportEnabled(false)
+        else
+            setSmartTeleportRecovered(false, args)
+        end
+        return false
+    end
+
+    -- Linhas ~4269–4280: exatamente em 15 s, uma única vez, salva três
+    -- flags e depois desliga as três.
+    if state == "Mega"
+        and ceilRemaining == SELL_PREP_SECONDS
+        and not teleportRuntime.autoStateSaved
+    then
+        saveAutoFlags(args, notify)
+
+        if notify then
+            notify(
+                "Contagem do mapa grande: "
+                .. tostring(ceilRemaining)
+                .. " s; desligando farm automático"
+            )
+        end
+    end
+
+    -- Linhas ~4286 / proto 175: <= 5 s, protegido por flag.
+    if state == "Mega"
+        and ceilRemaining <= SELL_TRIGGER_SECONDS
+        and not teleportRuntime.sellFlowStarted
+    then
+        teleportRuntime.sellFlowStarted = true
+        coroutine.wrap(function()
+            runSellFlow(remaining, notify)
+        end)()
+    end
+
+    -- Linhas ~4341–4361: Small -> Mega.
+    if state == "Small" and remaining <= 0 then
+        if label then
+        label.Text = "Teleportando para mapa grande..."
+        end
+
+        if notify then
+            notify("Contagem do mapa pequeno encerrada; iniciando teleporte")
+        end
+
+        resetChunkState(args, notify)
+
+        state = "Mega"
+        remaining = MEGA_COUNTDOWN_SECONDS
+        setTeleportCountdownState(holder, state, remaining)
+
+        if notify then
+            notify("Mapa grande carregado; contagem de 5500 s iniciada")
+        end
+
+        markEnterMega()
+        requestMega()
+        teleportRuntime.teleportIssuedAt = now
+        teleportRuntime.sellFlowStarted = false
+        return true
+    end
+
+    -- Linhas ~4363–4383: Mega -> Small.
+    if state == "Mega" and remaining <= 0 then
+        if label then
+        label.Text = "Teleportando para mapa pequeno..."
+        end
+
+        if notify then
+        notify("Contagem do mapa grande encerrada; iniciando teleporte")
+        end
+
+        restoreAutoFlags(args, notify)
+        resetChunkState(args, notify)
+
+        if not requestNormal() then
+            if label then
+                label.Text = "Aguardando confirmacao da venda..."
+            end
+            if notify then
+                notify("Venda ainda nao confirmada; teleporte cancelado para proteger o tamanho")
+            end
+            return true
+        end
+        teleportRuntime.teleportIssuedAt = now
+        teleportRuntime.sellFlowStarted = false
+        return true
+    end
+
+    -- Linhas ~4388–4413: timeout de 20 s. O original força Normal,
+    -- zera os contadores auxiliares e restaura o estado Mega/5500.
+    if teleportRuntime.teleportIssuedAt
+        and now - teleportRuntime.teleportIssuedAt > TELEPORT_TIMEOUT_SECONDS
+    then
+        if label then
+            label.Text = "Teleporte expirou; forçando mapa pequeno..."
+            if colors and colors.TextColor_Error then
+                label.TextColor3 = colors.TextColor_Error
+            end
+        end
+
+        if notify then
+            notify("Teleporte expirou após 20 s; forçando teleporte")
+        end
+
+        -- Nesse ramo o bytecode confirma pelo menos a restauração da
+        -- primeira flag salva antes de limpar o marcador.
+        if teleportRuntime.autoStateSaved and teleportRuntime.savedAutoFlags then
+            if args.setFirstAutoFlag then
+                args.setFirstAutoFlag(teleportRuntime.savedAutoFlags[1])
+            elseif args.setAutoFlags then
+                args.setAutoFlags(
+                    teleportRuntime.savedAutoFlags[1],
+                    teleportRuntime.savedAutoFlags[2],
+                    teleportRuntime.savedAutoFlags[3]
+                )
+            end
+            teleportRuntime.autoStateSaved = false
+            teleportRuntime.savedAutoFlags = nil
+        end
+
+        if not requestNormal() then
+            if label then
+                label.Text = "Aguardando confirmacao da venda..."
+            end
+            return true
+        end
+        resetChunkState(args, nil)
+
+        state = "Mega"
+        remaining = MEGA_COUNTDOWN_SECONDS
+        setTeleportCountdownState(holder, state, remaining)
+        updateTeleportCountdownLabel(label, colors, state, remaining)
+
+        -- Linha ~4413 grava um timestamp do ciclo novamente.
+        teleportRuntime.teleportIssuedAt = now
+        teleportRuntime.sellFlowStarted = false
+        return true
+    end
+
+    return true
+end
+
+-- O proto 153 real possui `task.wait(0.05)` dentro do laço.
+local function smartTeleportLoop(args)
+    while not args.isRunning or args.isRunning() do
+        if not smartTeleportTick(args) then
+            break
+        end
+        task.wait(0.05)
+    end
+end
+
+
+------------------------------------------------------------------------
+-- TOGGLE "Teleporte inteligente" — PROTO233 (V13)
+------------------------------------------------------------------------
+
+local smartTeleportEnabledRecovered = false
+local smartTeleportWorkerToken = 0
+
+local function renderSmartTeleportCountdownRecovered(label, colors, holder)
+    if not label or not holder then return end
+
+    local state = holder:GetAttribute("CountdownState")
+    local remaining = tonumber(holder:GetAttribute("RemainingTime")) or 0
+
+    if state == "Small" then
+        if colors and colors.TextColor_SmallToMega then
+            label.TextColor3 = colors.TextColor_SmallToMega
+        end
+        label.Text = "Mapa pequeno → mapa grande: " .. tostring(math.ceil(remaining))
+        return
+    end
+
+    if state == "Mega" then
+        if colors and colors.TextColor_MegaToSmall then
+            label.TextColor3 = colors.TextColor_MegaToSmall
+        end
+        label.Text = "Mapa grande → mapa pequeno: " .. tostring(math.ceil(remaining))
+        return
+    end
+
+    label.Text = "Iniciando sistema de teleporte..."
+    if colors and colors.TextColor_Loading then
+        label.TextColor3 = colors.TextColor_Loading
+    end
+end
+
+-- Proto233 linhas 4045–4073 / 4445–4457.
+setSmartTeleportRecovered = function(enabled, deps)
+    deps = deps or {}
+    enabled = enabled and true or false
+    smartTeleportEnabledRecovered = enabled
+
+    local holder = deps.holder or LocalPlayer
+    local label = deps.label
+    local colors = deps.colors
+    local log = deps.log or deps.notify
+
+    if enabled then
+        if holder:GetAttribute("CountdownState") == nil then
+            holder:SetAttribute("CountdownState", "Mega")
+        end
+        if holder:GetAttribute("RemainingTime") == nil then
+            holder:SetAttribute("RemainingTime", MEGA_COUNTDOWN_SECONDS)
+        end
+
+        renderSmartTeleportCountdownRecovered(label, colors, holder)
+
+        if log then
+            pcall(log, "Teleporte inteligente iniciado: classificação automática de mapas")
+        end
+
+        smartTeleportWorkerToken += 1
+        local token = smartTeleportWorkerToken
+
+        local args = deps.smartTeleportArgs or {}
+        args.holder = args.holder or holder
+        args.label = args.label or label
+        args.colors = args.colors or colors
+        args.notify = args.notify or log
+        args.isRunning = function()
+            return smartTeleportEnabledRecovered
+                and token == smartTeleportWorkerToken
+        end
+
+        coroutine.wrap(smartTeleportLoop)(args)
+        return true
+    end
+
+    if label then
+        label.Text = "Sistema de teleporte desativado"
+        label.TextColor3 = Color3.fromRGB(98, 216, 255)
+    end
+
+    if log then
+        pcall(log, "Teleporte inteligente desligado")
+    end
+
+    holder:SetAttribute("CountdownState", nil)
+    holder:SetAttribute("RemainingTime", nil)
+
+    smartTeleportWorkerToken += 1
+    teleportRuntime.teleportIssuedAt = nil
+    teleportRuntime.sellFlowStarted = false
+
+    return false
+end
+
+
+------------------------------------------------------------------------
+-- RECONHECIMENTO AUTOMÁTICO DE SMALL MAP — PROTOS 158/219/222/268
+------------------------------------------------------------------------
+
+local function setCubesForRecognizedMapRecovered()
+    ReplicatedStorage
+        :WaitForChild("Events")
+        :WaitForChild("SetCubes")
+        :FireServer()
+end
+
+local function smallRecognitionIsEnabledRecovered(deps)
+    if deps and deps.isEnabled then
+        local ok, value = pcall(deps.isEnabled)
+        if ok then return value and true or false end
+    end
+    return config.smallRecognizeEnabled and true or false
+end
+
+local function startSmallMapRecognitionCountdownRecovered(mapName, deps)
+    deps = deps or {}
+
+    if mapDetect.countdownRunning then return false end
+    mapDetect.countdownRunning = true
+
+    -- Proto158.
+    local seconds = math.max(
+        8,
+        math.floor(tonumber(mapDetect.delaySeconds or config.smallRecognizeDelaySeconds) or 10)
+    )
+
+    local hint = deps.countdownHint
+
+    while seconds > 0 do
+        if not smallRecognitionIsEnabledRecovered(deps) then
+            if hint then hint.Visible = false end
+            mapDetect.countdownRunning = false
+            return false
+        end
+
+        if hint then
+            hint.Text = tostring(seconds) .. " s para ativar o teleporte inteligente"
+            hint.Visible = true
+        end
+
+        task.wait(1)
+        seconds -= 1
+    end
+
+    if hint then hint.Visible = false end
+
+    if not smallRecognitionIsEnabledRecovered(deps) then
+        mapDetect.countdownRunning = false
+        return false
+    end
+
+    -- Relação proto158 -> proto233 confirmada.
+    setSmartTeleportRecovered(true, deps.smartTeleportDeps or deps)
+
+    if deps.log then
+        pcall(
+            deps.log,
+            "Mapa pequeno reconhecido: " .. tostring(mapName) .. "; teleporte inteligente ativado"
+        )
+    end
+
+    notifyDialog(
+        deps,
+                "Reconhecimento de mapa pequeno",
+        "Contagem encerrada; teleporte inteligente ativado",
+        3
+    )
+
+    mapDetect.countdownRunning = false
+    return true
+end
+
+local function smallMapRecognitionMonitorIterationRecovered(deps)
+    deps = deps or {}
+    task.wait(0.5)
+
+    if not smallRecognitionIsEnabledRecovered(deps) then
+        return false
+    end
+    if not hasEnabledSmallMapRecognitionRecovered() then
+        return true
+    end
+
+    local mapName = getCurrentMapNameRecovered()
+    if mapName == "" then return true end
+    if not isRecognizedSmallMapByNameRecovered(mapName) then
+        return true
+    end
+
+    local now = os.clock()
+    if mapDetect.lastMapName == mapName
+        and (now - (mapDetect.lastHitTime or 0)) <= 15
+    then
+        return true
+    end
+
+    mapDetect.lastMapName = mapName
+    mapDetect.lastHitTime = now
+
+    pcall(setCubesForRecognizedMapRecovered)
+
+    if deps.toast then
+        pcall(deps.toast, "Mapa pequeno reconhecido: " .. mapName, 2.5)
+    end
+    if deps.log then
+        pcall(
+            deps.log,
+            "Mapa pequeno reconhecido: " .. mapName .. "; teleporte será ativado após a contagem"
+        )
+    end
+
+    task.spawn(startSmallMapRecognitionCountdownRecovered, mapName, deps)
+    return true
+end
+
+local function startSmallMapRecognitionBootMonitorRecovered(deps)
+    deps = deps or {}
+
+    if mapDetect.bootMonitorRunning then return false end
+    mapDetect.bootMonitorRunning = true
+
+    task.spawn(function()
+        while mapDetect.bootMonitorRunning do
+            if not smallMapRecognitionMonitorIterationRecovered(deps) then
+                break
+            end
+        end
+        mapDetect.bootMonitorRunning = false
+    end)
+
+    return true
+end
+
+local function stopSmallMapRecognitionBootMonitorRecovered()
+    mapDetect.bootMonitorRunning = false
+    mapDetect.countdownRunning = false
+end
+
+-- Entrada autônoma: usa apenas serviços e helpers recuperados neste arquivo.
+-- `overrides` continua opcional para testes, mas não é necessário no jogo.
+local function setSmartTeleportStandaloneRecovered(enabled, label, overrides)
+    local deps = overrides or {}
+    deps.holder = deps.holder or LocalPlayer
+    deps.label = deps.label or label
+    deps.colors = deps.colors or {
+        TextColor_MegaToSmall = Color3.fromRGB(255, 211, 95),
+        TextColor_SmallToMega = Color3.fromRGB(98, 216, 255),
+        TextColor_Loading = Color3.fromRGB(98, 216, 255),
+        TextColor_Error = Color3.fromRGB(255, 96, 96),
+    }
+    deps.log = deps.log or function(message)
+        print("[ETW] " .. tostring(message))
+    end
+    deps.notify = deps.notify or deps.log
+    deps.smartTeleportArgs = deps.smartTeleportArgs or deps
+    return setSmartTeleportRecovered(enabled, deps)
+end
+
+local function setSmallRecognitionStandaloneRecovered(enabled, label, countdownHint)
+    config.smallRecognizeEnabled = enabled and true or false
+    if not enabled then
+        stopSmallMapRecognitionBootMonitorRecovered()
+        return false
+    end
+
+    refreshSmallMapRecognitionRecovered()
+    return startSmallMapRecognitionBootMonitorRecovered({
+        countdownHint = countdownHint,
+        log = function(message)
+            print("[ETW] " .. tostring(message))
+        end,
+        smartTeleportDeps = {
+            holder = LocalPlayer,
+            label = label,
+        },
+    })
+end
+
+
+
+
+------------------------------------------------------------------------
+-- ESTADO DO AUTO "刷 / 领 / 收" — PROTOS 221/238/184
+--
+-- O bytecode mostra três células locais independentes (registradores 33/34/35)
+-- capturadas pelos três protótipos. Na V12 o uso dos protótipos filhos
+-- permite nomear register33=刷, register34=领 e register35=收.
+------------------------------------------------------------------------
+
+local autoFarmStateRecovered = {
+    -- register33 -> proto246: farm principal ("刷")
+    autoFarmEnabled = false,
+    -- register34 -> proto177: 自动领宝箱 ("领")
+    autoClaimRewardsEnabled = false,
+    -- register35 -> proto216/proto167: coleta de Cubes ("收")
+    autoCollectCubesEnabled = false,
+    startedAt = 0,
+    paused = false,
+    lifecycleGeneration = 0,
+    lifecycleRunning = false,
+}
+
+getAutoFarmFlagsRecovered = function()
+    return autoFarmStateRecovered.autoFarmEnabled,
+        autoFarmStateRecovered.autoClaimRewardsEnabled,
+        autoFarmStateRecovered.autoCollectCubesEnabled
+end
+
+setAutoFarmFlagsRecovered = function(farm, claimRewards, collectCubes)
+    autoFarmStateRecovered.autoFarmEnabled = farm and true or false
+    autoFarmStateRecovered.autoClaimRewardsEnabled = claimRewards and true or false
+    autoFarmStateRecovered.autoCollectCubesEnabled = collectCubes and true or false
+end
+
+-- Proto 221, linhas ~1792–1801: no ramo de ativação, as três células recebem
+-- o mesmo booleano do callback e o timestamp é renovado antes de iniciar
+-- proto246 por coroutine.
+local function applyMainAutoToggleStateRecovered(enabled)
+    enabled = enabled and true or false
+
+    -- Cada mudança invalida o ciclo anterior. Isso impede duas conexões de
+    -- Heartbeat quando o botão é desligado e religado rapidamente.
+    autoFarmStateRecovered.lifecycleGeneration += 1
+
+    setAutoFarmFlagsRecovered(enabled, enabled, enabled)
+
+    if enabled then
+        autoFarmStateRecovered.startedAt = tick()
+        autoFarmStateRecovered.paused = false
+        return true
+    end
+
+    -- Proto221 linhas ~2167–2179: as três flags são desligadas, autoConn é
+    -- desconectado e CubeVis volta a ficar Enabled=true.
+    local conn = rawget(getgenv and getgenv() or _G, "autoConn")
+    if conn then
+        pcall(function()
+            conn:Disconnect()
+        end)
+    end
+
+    pcall(function()
+        local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
+        local cubeVis = playerScripts and playerScripts:FindFirstChild("CubeVis")
+        if cubeVis then
+            cubeVis.Enabled = true
+        end
+    end)
+
+    return false
+end
+
+-- Proto 238, linhas ~4694–4706: após wait(15), reativa as três células,
+-- grava tick(), limpa uma flag auxiliar e atualiza o botão para "Ligado".
+local function delayedEnableAutoFarmStateRecovered(buttonContainer, enabledColor, notify)
+    task.wait(15)
+
+    setAutoFarmFlagsRecovered(true, true, true)
+    autoFarmStateRecovered.startedAt = tick()
+    autoFarmStateRecovered.paused = false
+
+    if notify then
+        pcall(notify, "Farm, recompensas e coleta ativados")
+    end
+
+    if buttonContainer then
+        local button = buttonContainer:FindFirstChildWhichIsA("TextButton")
+        if button then
+            button.Text = "Ligado"
+            if enabledColor then
+                button.BackgroundColor3 = enabledColor
+            end
+        end
+    end
+
+    return true
+end
+
+-- Proto184 captura exatamente as mesmas três células e as zera durante o
+-- fechamento/limpeza geral.
+local function clearAutoFarmStateRecovered()
+    setAutoFarmFlagsRecovered(false, false, false)
+    autoFarmStateRecovered.paused = false
+end
+
+local setMainAutoRecovered
+
+
+
+
+------------------------------------------------------------------------
+-- SUBSISTEMAS "刷 / 领 / 收" — PROTO 177/224 E 216/167
+------------------------------------------------------------------------
+
+-- Proto177 captura root register34. O literal de erro é exatamente:
+-- "[Recompensas automáticas] Erro: ". O laço espera 1 segundo por iteração.
+local function autoClaimRewardsLoopRecovered(claimPass, logError)
+    while autoFarmStateRecovered.autoClaimRewardsEnabled do
+        task.wait(1)
+        local ok, err = pcall(function()
+            if claimPass then
+                claimPass()
+            end
+        end)
+        if not ok and logError then
+            logError("[Recompensas automáticas] Erro: " .. tostring(err))
+        end
+    end
+end
+
+-- Proto224 confirma:
+-- LocalPlayer:FindFirstChild("TimedRewards"), os.time(), ipairs(GetChildren()),
+-- tonumber(child.Value), RewardEvent:FireServer(<1 argumento>), wait(0.1),
+-- e SpinEvent:FireServer(...).
+--
+-- V14: o argumento foi fechado pela sequência 45–48 do proto224:
+-- registers[9] recebe registers[5], que é o objeto `reward` da iteração.
+local function claimTimedRewardsPassRecovered()
+    local timedRewards = LocalPlayer:FindFirstChild("TimedRewards")
+    if not timedRewards then
+        return false
+    end
+
+    local now = os.time()
+    local rewardEvent = Events and Events:FindFirstChild("RewardEvent")
+
+    for _, reward in ipairs(timedRewards:GetChildren()) do
+        local unlockAt = tonumber(reward.Value)
+        if unlockAt and unlockAt > 0 and now >= unlockAt and rewardEvent then
+            rewardEvent:FireServer(reward)
+            task.wait(0.1)
+        end
+    end
+
+    local spinEvent = Events and Events:FindFirstChild("SpinEvent")
+    if spinEvent then
+        -- A chamada existe no bytecode; nenhum argumento é atribuído sem prova.
+        spinEvent:FireServer()
+    end
+    return true
+end
+
+-- Proto167: percorre workspace:GetChildren(), filtra "Cube", compara
+-- Owner.Value com LocalPlayer.Name e copia target.CFrame.
+local function collectOwnedCubesPassRecovered(target)
+    if not target then
+        return 0
+    end
+
+    local moved = 0
+    for _, obj in ipairs(workspace:GetChildren()) do
+        if obj.Name == "Cube" then
+            local owner = obj:FindFirstChild("Owner")
+            if owner and owner.Value == LocalPlayer.Name then
+                obj.CFrame = target.CFrame
+                moved += 1
+            end
+        end
+    end
+    return moved
+end
+
+-- Proto216: CubeVis=false; enquanto register35 estiver ativo,
+-- espera 0.5 s e executa proto167 via pcall; ao sair restaura CubeVis.
+local function autoCollectCubesLoopRecovered(target)
+    local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
+    local cubeVis = playerScripts and playerScripts:FindFirstChild("CubeVis")
+    if cubeVis then
+        cubeVis.Enabled = false
+    end
+
+    while autoFarmStateRecovered.autoCollectCubesEnabled do
+        task.wait(0.5)
+        pcall(function()
+            local currentTarget = target
+            if not currentTarget or not currentTarget.Parent then
+                local character = LocalPlayer.Character
+                currentTarget = character and character:FindFirstChild("HumanoidRootPart")
+            end
+            collectOwnedCubesPassRecovered(currentTarget)
+        end)
+    end
+
+    if cubeVis then
+        cubeVis.Enabled = true
+    end
+end
+
+
+------------------------------------------------------------------------
+-- BASE/PLATAFORMA DO AUTO-FARM — PROTO 246 / 260
+------------------------------------------------------------------------
+
+-- Proto33, linhas-fonte 1636-1642: prepara os grupos usados pelo personagem
+-- e pela plataforma, e desliga colisão entre eles.
+local function ensureFarmCollisionGroupsRecovered()
+    pcall(function()
+        if not PhysicsService:IsCollisionGroupRegistered("PlayerGroup") then
+            PhysicsService:RegisterCollisionGroup("PlayerGroup")
+        end
+        if not PhysicsService:IsCollisionGroupRegistered("GroundGroup") then
+            PhysicsService:RegisterCollisionGroup("GroundGroup")
+        end
+        PhysicsService:CollisionGroupSetCollidable("PlayerGroup", "GroundGroup", false)
+    end)
+end
+
+-- Linhas-fonte ~1832–1841: o original cria uma peça grande sob o mapa.
+-- Valores e propriedades abaixo aparecem diretamente no bytecode.
+local function createFarmPlatformRecovered()
+    ensureFarmCollisionGroupsRecovered()
+    local part = Instance.new("Part")
+    part.Anchored = true
+    part.Size = Vector3.new(5048, 10, 2048)
+    part.Position = Vector3.new(0, -5, 0)
+    part.BrickColor = BrickColor.Black()
+    part.CanCollide = true
+    pcall(function()
+        -- Proto 260.
+        part.CollisionGroup = "GroundGroup"
+    end)
+    part.Parent = workspace
+    return part
+end
+
+-- Proto 246 também procura workspace.Map e workspace.Chunks e altera Parent
+-- durante a ativação/desativação. O destino exato do ramo de ativação ainda
+-- depende do fluxo flattenado; por isso não é forçado nesta reconstrução.
+
+
+------------------------------------------------------------------------
+-- STATUS GUI DO PROTO246
+------------------------------------------------------------------------
+
+local function createAutoFarmStatusGuiRecovered()
+    local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+    local previous = playerGui:FindFirstChild("AutoFarmStatusGui")
+    if previous then previous:Destroy() end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "AutoFarmStatusGui"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.Parent = playerGui
+
+    local label = Instance.new("TextLabel")
+    label.Name = "StatusText"
+    label.Size = UDim2.new(0, 350, 0, 180)
+    label.Position = UDim2.new(0, 64, 0, 64)
+    label.BackgroundTransparency = 1
+    label.TextColor3 = Color3.new(1, 1, 1)
+    label.TextStrokeColor3 = Color3.new(0, 0, 0)
+    label.TextStrokeTransparency = 0
+    label.TextWrapped = false
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Top
+    label.Font = Enum.Font.Ubuntu
+    label.TextScaled = false
+    label.TextSize = 14
+    label.Text = "Inicializando..."
+    label.Visible = true
+    label.Parent = gui
+
+    return gui, label
+end
+
+-- Proto114, chamado pelo proto192 antes de conectar o Heartbeat.
+local function applyPlayerCollisionGroupRecovered(character)
+    if not character then return end
+    ensureFarmCollisionGroupsRecovered()
+    pcall(function()
+        for _, descendant in ipairs(character:GetDescendants()) do
+            if descendant:IsA("BasePart") then
+                descendant.CollisionGroup = "PlayerGroup"
+            end
+        end
+    end)
+end
+
+local function setCharacterLocalScriptsRecovered(character, enabled)
+    if not character then return end
+
+    local chunkManager = character:FindFirstChild("LocalChunkManager")
+    if chunkManager then
+        chunkManager.Enabled = enabled
+    end
+
+    local animate = character:FindFirstChild("Animate")
+    if animate then
+        animate.Enabled = enabled
+    end
+end
+
+
+------------------------------------------------------------------------
+-- PERSONAGEM / AUTO-FARM
+------------------------------------------------------------------------
+
+local function getCharacterBindings(character)
+    if not character then return nil end
+
+    local humanoid = character:WaitForChild("Humanoid")
+    local root = character:WaitForChild("HumanoidRootPart")
+    local sizeValue = character:WaitForChild("Size")
+    local charEvents = character:WaitForChild("Events")
+
+    local eat = charEvents:FindFirstChild("Eat")
+    local grab = charEvents:FindFirstChild("Grab")
+    local sell = charEvents:FindFirstChild("Sell")
+    local sendTrack = character:FindFirstChild("SendTrack")
+    local currentChunk = character:FindFirstChild("CurrentChunk")
+
+    return {
+        humanoid = humanoid,
+        root = root,
+        sizeValue = sizeValue,
+        events = charEvents,
+        Eat = eat,
+        Grab = grab,
+        Sell = sell,
+        SendTrack = sendTrack,
+        CurrentChunk = currentChunk,
+    }
+end
+
+local function fallbackSell()
+    local sell = Events:FindFirstChild("Sell")
+    if sell then
+        sell:FireServer()
+        return true
+    end
+    return false
+end
+
+-- Proto 192 conecta Heartbeat e Died. O conteúdo do Heartbeat está no proto 133.
+-- Já foram recuperadas as peças: Upgrades.MaxSize.Value, math.cos/sin, Position,
+-- Size/HipHeight, reconhecimento de mapa, teleport cronometrado, stuck-respawn
+-- e atualização de status. A fórmula circular de movimento já foi linearizada.
+-- Linhas ~1985, ~1986 e ~1988 do proto 133.
+-- As três closures chamadas por pcall foram identificadas:
+--   proto 259 -> Grab:FireServer()
+--   proto 198 -> Eat:FireServer()
+--   proto 178 -> SendTrack:FireServer()
+-- O fluxo do proto133 fecha esta ordem a cada Heartbeat: Grab e Eat são
+-- incondicionais; SendTrack só roda quando o remote capturado em U25 existe.
+local function fireFarmRemotesRecovered(bindings)
+    if not bindings then return end
+    if sellTransitionPhaseRecovered then
+        -- Durante draining, conclui somente o bloco atual. Sem Grab, nenhum
+        -- bloco novo pode iniciar. Durante selling, nenhum remote de farm roda.
+        if sellTransitionPhaseRecovered == "draining" and bindings.Eat then
+            pcall(function() bindings.Eat:FireServer() end)
+        end
+        return
+    end
+    if bindings.Grab then
+        pcall(function() bindings.Grab:FireServer() end)
+    end
+    if bindings.Eat then
+        pcall(function() bindings.Eat:FireServer() end)
+    end
+    if bindings.SendTrack then
+        pcall(function() bindings.SendTrack:FireServer() end)
+    end
+end
+
+-- Proto 133, linhas-fonte ~1895–1905 e ~2092.
+-- Este bloco agora pôde ser linearizado quase por completo.
+-- O Heartbeat recebe `dt` em registers[1]. O estado angular fica em um
+-- upvalue persistente e é atualizado por Size.Value / LocalPlayer.Upgrades.MaxSize.Value.
+local orbitStateRecovered = {
+    phase = 0,
+}
+
+local function getLocalUpgradesRecovered()
+    return LocalPlayer and LocalPlayer:FindFirstChild("Upgrades")
+end
+
+local function computeOrbitPositionRecovered(bindings, farmPlatform, dt)
+    if not bindings or not bindings.humanoid or not bindings.root or not bindings.sizeValue then
+        return nil
+    end
+    local upgrades = getLocalUpgradesRecovered()
+    local maxSizeObj = upgrades and upgrades:FindFirstChild("MaxSize")
+    local maxSize = maxSizeObj and tonumber(maxSizeObj.Value) or nil
+    if not maxSize or maxSize == 0 then
+        return nil
+    end
+
+    -- L1895: phase += (Size.Value / Upgrades.MaxSize.Value) * dt
+    orbitStateRecovered.phase = orbitStateRecovered.phase
+        + ((tonumber(bindings.sizeValue.Value) or 0) / maxSize) * (tonumber(dt) or 0)
+
+    -- L1896
+    orbitStateRecovered.phase = orbitStateRecovered.phase % 65536
+
+    -- L1897–1899. O bytecode calcula um raio serrilhado 0..128 a partir da fase
+    -- e usa a própria fase como argumento de cos/sin.
+    local radius = (-orbitStateRecovered.phase * math.pi) % 128
+    local x = math.cos(orbitStateRecovered.phase) * radius
+    local z = math.sin(orbitStateRecovered.phase) * radius
+
+    -- L1901: topo da plataforma = Position.Y + Size.Y / 2.
+    local baseY = 0
+    if farmPlatform then
+        baseY = farmPlatform.Position.Y + (farmPlatform.Size.Y / 2)
+    end
+
+    -- L1904–1905: HipHeight + metade da altura do Root + offset literal 5.
+    local hipHeight = bindings.humanoid and bindings.humanoid.HipHeight or 0
+    local rootHalfY = bindings.root and (bindings.root.Size.Y / 2) or 2.5
+    local y = baseY + hipHeight + rootHalfY + 5
+
+    return x, y, z
+end
+
+-- L2092: CFrame.new(x,y,z) * CFrame.Angles(0, atan2(x,z)+pi, 0)
+local function buildMovementFrameRecovered(x, y, z)
+    return CFrame.new(x, y, z)
+        * CFrame.Angles(0, math.atan2(x, z) + math.pi, 0)
+end
+
+local function applyRecoveredMovement(bindings, farmPlatform, dt)
+    if not bindings or not bindings.root or not bindings.humanoid then return false end
+
+    local baseY = 0
+    if farmPlatform then
+        baseY = farmPlatform.Position.Y + (farmPlatform.Size.Y / 2)
+    end
+    local y = baseY + bindings.humanoid.HipHeight + (bindings.root.Size.Y / 2) + 5
+
+    -- Com U37/R42=false, o original escolhe um dos dois pares fixos. Esse é
+    -- o modo normal de comer parado mostrado pelo usuário.
+    if not circularMovementRecovered then
+        local x
+        local z
+        local mode
+        if skipState58 then
+            x = tonumber(config.teleportPosX) or teleportPosX
+            z = tonumber(config.teleportPosZ) or teleportPosZ
+            mode = "timed-teleport"
+        else
+            local mapName = getCurrentMapNameRecovered()
+            if isRobloxiaCityFarmMapRecovered(mapName) then
+                specialFarmPositionRuntime.mapName = mapName
+                specialFarmPositionRuntime.x = ROBLOXIA_CITY_FARM_POSITION.X
+                specialFarmPositionRuntime.z = ROBLOXIA_CITY_FARM_POSITION.Z
+                x = ROBLOXIA_CITY_FARM_POSITION.X
+                y = ROBLOXIA_CITY_FARM_POSITION.Y
+                z = ROBLOXIA_CITY_FARM_POSITION.Z
+                mode = "robloxia-city-fixed-position"
+            else
+                x = tonumber(config.idlePosX) or idlePosX
+                z = tonumber(config.idlePosZ) or idlePosZ
+                mode = "fixed-farm"
+            end
+        end
+        bindings.root.CFrame = CFrame.new(x, y, z)
+        return true, x, y, z, mode
+    end
+
+    local x, orbitY, z = computeOrbitPositionRecovered(bindings, farmPlatform, dt)
+    if x == nil then return false end
+    y = orbitY
+
+    -- Proto133 U4 = célula compartilhada R58. Depois do disparo temporizado,
+    -- as linhas 2094-2096 mantêm a posição fixa configurada.
+    if skipState58 then
+        x = tonumber(config.teleportPosX) or teleportPosX
+        z = tonumber(config.teleportPosZ) or teleportPosZ
+        bindings.root.CFrame = CFrame.new(x, y, z)
+        return true, x, y, z, "timed-teleport"
+    end
+
+    bindings.root.CFrame = buildMovementFrameRecovered(x, y, z)
+    return true, x, y, z, "circular"
+end
+
+local function setCircularMovementRecovered(enabled)
+    circularMovementRecovered = enabled and true or false
+    orbitStateRecovered.phase = 0
+    return circularMovementRecovered
+end
+
+local function getMovementHeightInputsRecovered(bindings, farmPlatform)
+    if not bindings or not bindings.humanoid or not bindings.root then return nil end
+    return {
+        platformTopY = farmPlatform and (farmPlatform.Position.Y + farmPlatform.Size.Y / 2) or 0,
+        hipHeight = bindings.humanoid.HipHeight,
+        rootHalfY = bindings.root.Size.Y / 2,
+        literalOffset = 5,
+    }
+end
+
+local heartbeatRuntime = {
+    lastTimedTeleportAt = 0,
+    mapStartedAt = tick(),
+    timedTeleportTriggered = false,
+    lastSize = nil,
+    lastSizeChangeAt = tick(),
+    previousMapElapsedSeconds = 0,
+    lastStatusUpdateAt = 0,
+}
+
+local function updateChunkCounterRecovered(currentChunk, dt)
+    -- Proto133 linhas 1990-2004: conta a borda false -> true e mantém U30,
+    -- o tempo contínuo sem CurrentChunk ativo.
+    local active = false
+    if currentChunk and currentChunk.Parent then
+        local ok, value = pcall(function()
+            return currentChunk.Value
+        end)
+        if ok then active = value and true or false end
+    end
+
+    if active and not chunkRuntimeRecovered.previousActive then
+        chunkRuntimeRecovered.total += 1
+    end
+    chunkRuntimeRecovered.previousActive = active
+
+    if active then
+        chunkRuntimeRecovered.noChunkSeconds = 0
+    else
+        chunkRuntimeRecovered.noChunkSeconds += math.max(0, tonumber(dt) or 0)
+    end
+
+    return chunkRuntimeRecovered.total, chunkRuntimeRecovered.noChunkSeconds
+end
+
+local function finishSellTransitionRecovered(delaySeconds)
+    task.wait(delaySeconds)
+    -- Protos 242 (8 s) e 176 (3 s) terminam restaurando o estado,
+    -- chamando proto50/SetServerSettings e soltando o debounce.
+    local elapsed = math.max(0, tick() - heartbeatRuntime.mapStartedAt)
+    -- Protos 176/242 só preservam o intervalo anterior quando ele alcança 60 s.
+    if elapsed >= 60 then
+        heartbeatRuntime.previousMapElapsedSeconds = elapsed
+    end
+    pcall(forceSwitchMapRecovered)
+    skipState58 = false
+    heartbeatRuntime.timedTeleportTriggered = false
+    heartbeatRuntime.mapStartedAt = tick()
+    blockedFarmMapRuntime.mapIdentificationStartedAt = tick()
+    specialFarmPositionRuntime.mapName = ""
+    specialFarmPositionRuntime.x = nil
+    specialFarmPositionRuntime.z = nil
+    chunkRuntimeRecovered.sellDebounce = false
+end
+
+local function processAutoSellRecovered(bindings)
+    if not bindings or not bindings.sizeValue or not bindings.Sell then return false end
+    if sellTransitionPhaseRecovered then return false end
+
+    local upgrades = getLocalUpgradesRecovered()
+    local maxSizeObject = upgrades and upgrades:FindFirstChild("MaxSize")
+    local currentSize = tonumber(bindings.sizeValue.Value)
+    local maxSize = maxSizeObject and tonumber(maxSizeObject.Value) or nil
+    if not currentSize or not maxSize then return false end
+
+    local noChunkSeconds = chunkRuntimeRecovered.noChunkSeconds
+    -- Proto133 PCs 497–498/593–595: MaxSize <= Size + 2.
+    local capacityReached = maxSize <= currentSize + 2
+    if not capacityReached and noChunkSeconds <= 12 then
+        return false
+    end
+
+    -- Proto149 (capacidade) e proto166 (timeout) chamam o mesmo Sell sem args.
+    pcall(function() bindings.Sell:FireServer() end)
+    chunkRuntimeRecovered.total = 0
+
+    if not chunkRuntimeRecovered.sellDebounce then
+        chunkRuntimeRecovered.sellDebounce = true
+        local delaySeconds = noChunkSeconds < 12 and 8 or 3
+        task.spawn(finishSellTransitionRecovered, delaySeconds)
+    end
+    return true
+end
+
+-- Proto 133, linhas 1889–1959: utilitários de status recuperados.
+local STATUS_FORMAT_RECOVERED = table.concat({
+    "Executando...",
+    "Tempo em execução: %ih%im%is",
+    "Tempo efetivo: %im%is",
+    "Rendimento diário: %s",
+    "Mapa anterior: %im%is",
+    "Mapa atual: %im%is",
+    "Total de blocos: %i",
+}, "\n")
+
+local function splitMSRecovered(seconds)
+    seconds = math.max(0, tonumber(seconds) or 0)
+    return math.floor(seconds / 60), math.floor(seconds) % 60
+end
+
+local function splitHMSRecovered(seconds)
+    seconds = math.max(0, tonumber(seconds) or 0)
+    return math.floor(seconds / 3600), math.floor(seconds / 60) % 60, math.floor(seconds) % 60
+end
+
+local function formatDailyIncomeRecovered(value)
+    value = tonumber(value) or 0
+    if value >= 100000000 then
+        return string.format("%.2f milhões", value / 1000000)
+    elseif value >= 10000 then
+        return string.format("%.2f mil", value / 1000)
+    end
+    return tostring(value)
+end
+
+local function buildStatusTextRecovered(args)
+    args = args or {}
+    local rh, rm, rs = splitHMSRecovered(args.runElapsedSeconds)
+    local am, as = splitMSRecovered(args.actualElapsedSeconds)
+    local pm, ps = splitMSRecovered(args.previousMapElapsedSeconds)
+    local cm, cs = splitMSRecovered(args.currentMapElapsedSeconds)
+    local daily = args.dailyIncomeText or formatDailyIncomeRecovered(args.dailyIncome or 0)
+    return string.format(STATUS_FORMAT_RECOVERED, rh, rm, rs, am, as, daily, pm, ps, cm, cs, math.floor(tonumber(args.totalChunks) or 0))
+end
+
+-- Proto53 / linha 1602: PCs 2–4 fazem +0.5, potência 2 e -0.25;
+-- PCs 47–48 completam /2 e *100 antes de math.floor.
+local function sizeMetricRecovered(value)
+    return math.floor((((value + 0.5) ^ 2 - 0.25) / 2) * 100)
+end
+
+-- Proto 133, linhas 1906–1919, agora sem callback/desconhecido.
+local function computeDailyIncomeRecovered()
+    local upgrades = LocalPlayer and LocalPlayer:FindFirstChild("Upgrades")
+    if not upgrades then return nil end
+    local multi = upgrades:FindFirstChild("Multiplier")
+    local maxSize = upgrades:FindFirstChild("MaxSize")
+    if not multi or not maxSize then return nil end
+
+    local multiplierScale = multi.Value / 100
+    if multiplierScale == 0 then return nil end
+
+    local normalizedMax = maxSize.Value / multiplierScale
+    local halfNormalizedMax = normalizedMax / 2
+    if halfNormalizedMax == 0 then return nil end
+
+    local metric = sizeMetricRecovered(maxSize.Value)
+    local perSecond = math.floor(metric / halfNormalizedMax)
+    local daily = perSecond * 60 * 60 * 24
+    return daily, formatDailyIncomeRecovered(daily)
+end
+
+-- O formato e os cálculos já estavam recuperados, mas a V22 não os ligava ao
+-- TextLabel. Atualiza quatro vezes por segundo para não pesar no Heartbeat.
+local function updateAutoFarmStatusRecovered(statusLabel)
+    if not statusLabel or not statusLabel.Parent then return false end
+    local now = tick()
+    if now - (heartbeatRuntime.lastStatusUpdateAt or 0) < 0.25 then return false end
+    heartbeatRuntime.lastStatusUpdateAt = now
+
+    local startedAt = tonumber(autoFarmStateRecovered.startedAt) or now
+    local mapStartedAt = tonumber(heartbeatRuntime.mapStartedAt) or now
+    local daily, dailyText = computeDailyIncomeRecovered()
+    statusLabel.Text = buildStatusTextRecovered({
+        runElapsedSeconds = now - startedAt,
+        actualElapsedSeconds = now - startedAt,
+        dailyIncome = daily or 0,
+        dailyIncomeText = dailyText,
+        previousMapElapsedSeconds = heartbeatRuntime.previousMapElapsedSeconds or 0,
+        currentMapElapsedSeconds = now - mapStartedAt,
+        totalChunks = chunkRuntimeRecovered.total,
+    })
+    return true
+end
+
+-- Proto 133 linhas ~1926–1937. O Y usado pelo original é calculado em outro
+-- bloco; recebe targetY para não inventar a fórmula.
+local function timedTeleportHeartbeat(bindings, mapElapsedSeconds, targetY, notify, detailedNotify)
+    if not bindings or not bindings.root or not config.timedTeleportEnabled then return false end
+    if heartbeatRuntime.timedTeleportTriggered then return false end
+
+    local thresholdSeconds = tonumber(config.teleportMinutes) or 240
+    if thresholdSeconds <= 0 then return false end
+    if (tonumber(mapElapsedSeconds) or 0) < thresholdSeconds then return false end
+
+    local x = tonumber(config.teleportPosX) or -260
+    local z = tonumber(config.teleportPosZ) or 800
+    targetY = tonumber(targetY) or bindings.root.Position.Y
+    bindings.root.CFrame = CFrame.new(x, targetY, z)
+
+    heartbeatRuntime.timedTeleportTriggered = true
+    heartbeatRuntime.lastTimedTeleportAt = tick()
+    skipState58 = true
+
+    local message = string.format(
+        "Teleporte temporizado: mapa atual atingiu %.0f s; indo para (%.0f, %.0f)",
+        thresholdSeconds, x, z
+    )
+    if notify then pcall(notify, message) end
+    if detailedNotify then pcall(detailedNotify, "Teleporte temporizado", message, 4) end
+    return true, message
+end
+
+-- Proto 133 linhas ~2026–2035.
+local function stuckRespawnHeartbeat(bindings, notify)
+    if not bindings or not bindings.humanoid or not bindings.sizeValue then return false end
+
+    local current = bindings.sizeValue.Value
+    if not config.stuckRespawnEnabled then
+        heartbeatRuntime.lastSize = current
+        heartbeatRuntime.lastSizeChangeAt = tick()
+        return false
+    end
+
+    if heartbeatRuntime.lastSize == nil or current ~= heartbeatRuntime.lastSize then
+        heartbeatRuntime.lastSize = current
+        heartbeatRuntime.lastSizeChangeAt = tick()
+        return false
+    end
+
+    local limit = tonumber(config.stuckRespawnSeconds) or 60
+    local unchangedFor = tick() - heartbeatRuntime.lastSizeChangeAt
+    if unchangedFor <= limit then return false end
+
+    if notify then
+        notify("Tamanho do personagem sem aumentar por " .. tostring(math.floor(unchangedFor)) .. " s; personagem reiniciado automaticamente")
+    end
+    pcall(function() bindings.humanoid.Health = 0 end)
+    heartbeatRuntime.lastSizeChangeAt = tick()
+    return true
+end
+
+local heartbeatConnection
+local activeFarmPlatformRecovered
+
+local characterDiedConnectionRecovered
+
+-- Proto196: desconecta o Heartbeat e contém a mensagem literal abaixo.
+local function onFarmCharacterDiedRecovered(notify)
+    if heartbeatConnection then
+        pcall(function() heartbeatConnection:Disconnect() end)
+        heartbeatConnection = nil
+    end
+
+    heartbeatRuntime.lastSizeChangeAt = tick()
+    heartbeatRuntime.timedTeleportTriggered = false
+    skipState58 = false
+
+    if notify then
+        pcall(notify, "Personagem morreu; contagem de blocos preservada")
+    end
+end
+
+-- Proto192 com timeouts e mensagens recuperados diretamente.
+local function attachCharacterLifecycleRecovered(character, statusLabel, notify)
+    if not character then return nil end
+
+    if heartbeatConnection then
+        pcall(function() heartbeatConnection:Disconnect() end)
+        heartbeatConnection = nil
+    end
+
+    local humanoid = character:WaitForChild("Humanoid", 5)
+    local root = character:WaitForChild("HumanoidRootPart", 5)
+    local sizeValue = character:WaitForChild("Size", 5)
+    local charEvents = character:WaitForChild("Events", 5)
+
+    if not humanoid or not root or not sizeValue or not charEvents then
+        if statusLabel then statusLabel.Text = "Falha ao carregar o personagem!" end
+        return nil
+    end
+
+    local eat = charEvents:FindFirstChild("Eat")
+    local grab = charEvents:FindFirstChild("Grab")
+    local sell = charEvents:FindFirstChild("Sell")
+    local sendTrack = character:FindFirstChild("SendTrack")
+    local currentChunk = character:FindFirstChild("CurrentChunk")
+
+    if not eat or not grab or not sell then
+        if statusLabel then statusLabel.Text = "Eventos de ação ausentes!" end
+        return nil
+    end
+
+    local bindings = {
+        humanoid = humanoid,
+        root = root,
+        sizeValue = sizeValue,
+        events = charEvents,
+        Eat = eat,
+        Grab = grab,
+        Sell = sell,
+        SendTrack = sendTrack,
+        CurrentChunk = currentChunk,
+    }
+
+    applyPlayerCollisionGroupRecovered(character)
+    humanoid:ChangeState(Enum.HumanoidStateType.Running)
+    heartbeatRuntime.lastSize = sizeValue.Value
+    heartbeatRuntime.lastSizeChangeAt = tick()
+    heartbeatRuntime.mapStartedAt = tick()
+    heartbeatRuntime.previousMapElapsedSeconds = 0
+    heartbeatRuntime.lastStatusUpdateAt = 0
+    heartbeatRuntime.timedTeleportTriggered = false
+    skipState58 = false
+
+    heartbeatConnection = RunService.Heartbeat:Connect(function(dt)
+        if not autoFarmStateRecovered.autoFarmEnabled then return end
+        if not humanoid.Parent or not root.Parent or not sizeValue.Parent then return end
+        if suppressFarmOnSkippedMapRecovered(statusLabel, notify) then return end
+
+        local _, _, movementY = applyRecoveredMovement(bindings, activeFarmPlatformRecovered, dt)
+        timedTeleportHeartbeat(
+            bindings,
+            tick() - heartbeatRuntime.mapStartedAt,
+            movementY,
+            notify,
+            notifyDialogRecovered
+        )
+        fireFarmRemotesRecovered(bindings)
+        updateChunkCounterRecovered(bindings.CurrentChunk, dt)
+        processAutoSellRecovered(bindings)
+        stuckRespawnHeartbeat(bindings, notify)
+        updateAutoFarmStatusRecovered(statusLabel)
+    end)
+
+    if characterDiedConnectionRecovered then
+        pcall(function() characterDiedConnectionRecovered:Disconnect() end)
+    end
+    characterDiedConnectionRecovered = humanoid.Died:Connect(function()
+        onFarmCharacterDiedRecovered(notify)
+    end)
+
+    -- Proto192 linhas 2111–2114.
+    setCharacterLocalScriptsRecovered(character, false)
+
+    return bindings
+end
+
+local function hideWorldMapForFarmRecovered()
+    local map = workspace:FindFirstChild("Map")
+    local chunks = workspace:FindFirstChild("Chunks")
+    if map then map.Parent = nil end
+    if chunks then chunks.Parent = nil end
+    return map, chunks
+end
+
+local function restoreWorldMapAfterFarmRecovered(map, chunks)
+    if map then map.Parent = workspace end
+    if chunks then
+        -- O Parent final de Chunks passa por um registrador reutilizado no
+        -- dispatcher. workspace é o fallback explícito desta reconstrução.
+        chunks.Parent = workspace
+    end
+end
+
+-- Proto246 linearizado no nível de ciclo de vida.
+local function runMainAutoFarmLifecycleRecovered(notify, lifecycleGeneration)
+    autoFarmStateRecovered.lifecycleRunning = true
+    local statusGui, statusLabel = createAutoFarmStatusGuiRecovered()
+    local platform = createFarmPlatformRecovered()
+    activeFarmPlatformRecovered = platform
+
+    local map, chunks = hideWorldMapForFarmRecovered()
+
+    local function attachCurrent(character)
+        task.spawn(function()
+            if not autoFarmStateRecovered.autoFarmEnabled
+                or autoFarmStateRecovered.lifecycleGeneration ~= lifecycleGeneration then
+                return
+            end
+            attachCharacterLifecycleRecovered(character, statusLabel, notify)
+        end)
+    end
+
+    if LocalPlayer.Character then
+        attachCurrent(LocalPlayer.Character)
+    else
+        -- CharacterAdded:Wait() prendia a rotina mesmo depois de desligar.
+        while not LocalPlayer.Character
+            and autoFarmStateRecovered.autoFarmEnabled
+            and autoFarmStateRecovered.lifecycleGeneration == lifecycleGeneration do
+            task.wait()
+        end
+        if LocalPlayer.Character then
+            attachCurrent(LocalPlayer.Character)
+        end
+    end
+
+    local characterConnection = LocalPlayer.CharacterAdded:Connect(attachCurrent)
+
+    while autoFarmStateRecovered.autoFarmEnabled
+        and autoFarmStateRecovered.lifecycleGeneration == lifecycleGeneration do
+        task.wait()
+
+        local loading = workspace:FindFirstChild("Loading")
+        if loading then
+            pcall(function() loading:Destroy() end)
+        end
+
+        if map then map.Parent = nil end
+        if chunks then chunks.Parent = nil end
+    end
+
+    if characterConnection then
+        pcall(function() characterConnection:Disconnect() end)
+    end
+    if heartbeatConnection then
+        pcall(function() heartbeatConnection:Disconnect() end)
+        heartbeatConnection = nil
+    end
+    if characterDiedConnectionRecovered then
+        pcall(function() characterDiedConnectionRecovered:Disconnect() end)
+        characterDiedConnectionRecovered = nil
+    end
+
+    restoreWorldMapAfterFarmRecovered(map, chunks)
+
+    local character = LocalPlayer.Character
+    if character then
+        local humanoid = character:FindFirstChild("Humanoid")
+        if humanoid then
+            humanoid.PlatformStand = false
+            pcall(function()
+                humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+            end)
+        end
+        setCharacterLocalScriptsRecovered(character, true)
+    end
+
+    if notify then
+        pcall(notify, "Farm automático desligado; contagem de blocos preservada")
+    end
+
+    if statusGui then pcall(function() statusGui:Destroy() end) end
+    if platform then pcall(function() platform:Destroy() end) end
+    if activeFarmPlatformRecovered == platform then
+        activeFarmPlatformRecovered = nil
+    end
+    autoFarmStateRecovered.lifecycleRunning = false
+end
+
+
+
+setMainAutoRecovered = function(enabled, deps)
+    deps = deps or {}
+    enabled = enabled and true or false
+
+    if enabled and autoFarmStateRecovered.autoFarmEnabled then
+        return true
+    end
+
+    applyMainAutoToggleStateRecovered(enabled)
+    local lifecycleGeneration = autoFarmStateRecovered.lifecycleGeneration
+
+    if not enabled then
+        return false
+    end
+
+    task.spawn(function()
+        -- Aguarda a limpeza do ciclo invalidado antes de criar GUI, plataforma
+        -- e Heartbeat novos. O token também cancela ativações antigas pendentes.
+        while autoFarmStateRecovered.lifecycleRunning do task.wait() end
+        if not autoFarmStateRecovered.autoFarmEnabled
+            or autoFarmStateRecovered.lifecycleGeneration ~= lifecycleGeneration then
+            return
+        end
+
+        task.spawn(function()
+            autoClaimRewardsLoopRecovered(function()
+                claimTimedRewardsPassRecovered()
+            end, deps.log)
+        end)
+        task.spawn(function()
+            autoCollectCubesLoopRecovered()
+        end)
+        runMainAutoFarmLifecycleRecovered(deps.log or deps.notify, lifecycleGeneration)
+    end)
+
+    return true
+end
+
+-- Invisibilidade do autofarmhx: guarda e restaura a Transparency de BaseParts.
+local invisibleEnabledRecovered = false
+local originalPartTransparencyRecovered = setmetatable({}, { __mode = "k" })
+local invisibleCharacterConnectionRecovered
+local invisibleDescendantConnectionRecovered
+
+local function applyInvisiblePartRecovered(item)
+    if not invisibleEnabledRecovered or not item:IsA("BasePart") then return end
+    if originalPartTransparencyRecovered[item] == nil then
+        originalPartTransparencyRecovered[item] = item.Transparency
+    end
+    item.Transparency = 1
+end
+
+local function attachInvisibleCharacterRecovered(character)
+    if invisibleDescendantConnectionRecovered then
+        invisibleDescendantConnectionRecovered:Disconnect()
+        invisibleDescendantConnectionRecovered = nil
+    end
+    if not invisibleEnabledRecovered or not character then return end
+    for _, item in ipairs(character:GetDescendants()) do
+        applyInvisiblePartRecovered(item)
+    end
+    invisibleDescendantConnectionRecovered = character.DescendantAdded:Connect(applyInvisiblePartRecovered)
+end
+
+local function setInvisibleRecovered(enabled)
+    enabled = enabled and true or false
+    if invisibleEnabledRecovered == enabled then return end
+    invisibleEnabledRecovered = enabled
+    if enabled then
+        invisibleCharacterConnectionRecovered = LocalPlayer.CharacterAdded:Connect(attachInvisibleCharacterRecovered)
+        attachInvisibleCharacterRecovered(LocalPlayer.Character)
+    else
+        if invisibleCharacterConnectionRecovered then
+            invisibleCharacterConnectionRecovered:Disconnect()
+            invisibleCharacterConnectionRecovered = nil
+        end
+        if invisibleDescendantConnectionRecovered then
+            invisibleDescendantConnectionRecovered:Disconnect()
+            invisibleDescendantConnectionRecovered = nil
+        end
+        for part, transparency in pairs(originalPartTransparencyRecovered) do
+            if part.Parent then part.Transparency = transparency end
+        end
+        originalPartTransparencyRecovered = setmetatable({}, { __mode = "k" })
+    end
+end
+
+-- Ciclo contínuo: esgotar as caixas no mega, voltar ao normal e aguardar 13 s.
+local cycleWorkerStartedRecovered = false
+
+local function readCycleMapNameRecovered()
+    local name = getCurrentMapNameRecovered()
+    if name ~= "" then return name end
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    local screenGui = playerGui and playerGui:FindFirstChild("ScreenGui")
+    if not screenGui then return "" end
+    for _, item in ipairs(screenGui:GetDescendants()) do
+        if item:IsA("TextLabel") and item.Visible then
+            local shown = tostring(item.Text or "")
+            local normalized = normalizeMapNameRecovered(shown)
+            if normalized == "cidadederobloxia" or normalized == "robloxiacity"
+                or normalized == "mega" or normalized == "megabaseplate"
+                or normalized == "baseplate" then
+                return shown
+            end
+        end
+    end
+    return ""
+end
+
+local function cycleMapIsMegaRecovered()
+    local name = normalizeMapNameRecovered(readCycleMapNameRecovered())
+    if name == "" then return nil end
+    return name:find("mega", 1, true) ~= nil
+        or name == "baseplate" or name == "placabase"
+end
+
+local function hasOwnedBoxesRecovered()
+    for _, item in ipairs(workspace:GetChildren()) do
+        if item.Name == "Cube" then
+            local owner = item:FindFirstChild("Owner")
+            if owner and owner.Value == LocalPlayer.Name then return true end
+        end
+    end
+    return false
+end
+
+local function startMapCycleRecovered()
+    if cycleWorkerStartedRecovered then return end
+    cycleWorkerStartedRecovered = true
+    task.spawn(function()
+        local state, since, emptySince, lastRequest, sawBoxes = nil, nil, nil, 0, false
+        while task.wait(1) do
+            if not autoFarmStateRecovered.autoFarmEnabled then
+                state, since, emptySince, lastRequest, sawBoxes = nil, nil, nil, 0, false
+            else
+                local mega = cycleMapIsMegaRecovered()
+                local now = tick()
+                if state == nil then
+                    state, since = mega == true and "mega" or "normal", now
+                    sawBoxes = false
+                elseif state == "normal" then
+                    if mega == true then
+                        state, since, emptySince, sawBoxes = "mega", now, nil, false
+                    elseif now - since >= 23 and now - lastRequest >= 10 then
+                        if RequestTeleport and pcall(requestMega) then
+                            state, since, lastRequest = "waitingMega", now, now
+                        end
+                    end
+                elseif state == "waitingMega" then
+                    if mega == true or now - since >= 5 then
+                        state, since, emptySince, sawBoxes = "mega", now, nil, false
+                    end
+                elseif state == "mega" then
+                    if hasOwnedBoxesRecovered() then
+                        sawBoxes, emptySince = true, nil
+                    elseif now - since >= 30 then
+                        state, lastRequest = "returning", 0
+                    end
+                elseif state == "draining" then
+                    if hasOwnedBoxesRecovered() then
+                        state, sawBoxes, emptySince = "mega", true, nil
+                    else
+                        emptySince = emptySince or now
+                        if now - emptySince >= 3 then
+                            state, lastRequest = "returning", 0
+                        end
+                    end
+                elseif state == "returning" then
+                    if now - lastRequest >= 10 then
+                        local callOk, teleported = pcall(requestNormal)
+                        if callOk and teleported then
+                            state, since, lastRequest = "waitingNormal", now, now
+                        end
+                    end
+                elseif state == "waitingNormal" then
+                    if (mega == false and now - since >= 2) or now - since >= 5 then
+                        state, since, emptySince, sawBoxes = "normal", now, nil, false
+                    end
+                end
+            end
+        end
+    end)
+end
+
+
+
+local function setFarmPlatformRecovered(part)
+    activeFarmPlatformRecovered = part
+end
+
+local function attachCharacter(character)
+    local b = getCharacterBindings(character)
+    if not b then return end
+
+    applyPlayerCollisionGroupRecovered(character)
+    b.humanoid:ChangeState(Enum.HumanoidStateType.Running)
+
+    if heartbeatConnection then
+        heartbeatConnection:Disconnect()
+        heartbeatConnection = nil
+    end
+
+    heartbeatConnection = RunService.Heartbeat:Connect(function(dt)
+        -- Proto 133 inicia com guardas para Humanoid / Root / Size.
+        if not b.humanoid or not b.root or not b.sizeValue then return end
+        if suppressFarmOnSkippedMapRecovered(nil, nil) then return end
+
+        -- L1895–1905 + L2092.
+        local _, _, movementY = applyRecoveredMovement(b, activeFarmPlatformRecovered, dt)
+        timedTeleportHeartbeat(
+            b,
+            tick() - heartbeatRuntime.mapStartedAt,
+            movementY,
+            nil,
+            notifyDialogRecovered
+        )
+
+        -- L1985: Grab; L1986: Eat; L1988: SendTrack somente se existir.
+        -- Esses três blocos estão dentro de pcall no original.
+        fireFarmRemotesRecovered(b)
+        updateChunkCounterRecovered(b.CurrentChunk, dt)
+        processAutoSellRecovered(b)
+
+        -- L2026–2035.
+        stuckRespawnHeartbeat(b)
+    end)
+
+    b.humanoid.Died:Connect(function()
+        -- O original limpa/reagenda estado de personagem e reconecta a lógica.
+    end)
+end
+
+------------------------------------------------------------------------
+-- STRINGS/SEÇÕES DA GUI CONFIRMADAS
+------------------------------------------------------------------------
+
+local RecoveredUI = {
+    Title = "ETW Pro 2.1",
+    MainAutoSection = "Farm automático",
+    SmartTeleport = "Teleporte inteligente",
+    AutoUpgradeSection = "Upgrades automáticos",
+    RoundControlSection = "Controle de rodadas",
+    SkipMapSection = "Mapas ignorados",
+    Studville = "Studville",
+    BlockTown = "Block Town",
+    MiddleRobloxia = "Middle Robloxia",
+    Crossroads = "Crossroads",
+}
+
+------------------------------------------------------------------------
+-- GUI FUNCIONAL RECONSTRUÍDA — V22
+------------------------------------------------------------------------
+
+local recoveredMainGui
+
+local function createRecoveredMainGui()
+    if recoveredMainGui then
+        pcall(function() recoveredMainGui:Destroy() end)
+    end
+
+    local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+    local old = playerGui:FindFirstChild("ETWRecoveredGui")
+    if old then old:Destroy() end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "ETWRecoveredGui"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = playerGui
+    recoveredMainGui = gui
+
+    local main = Instance.new("Frame")
+    main.Name = "Main"
+    main.Size = UDim2.fromOffset(180, 96)
+    main.Position = UDim2.new(0, 100, 0.5, -48)
+    main.BackgroundColor3 = Color3.fromRGB(18, 36, 60)
+    main.BorderColor3 = Color3.fromRGB(222, 183, 91)
+    main.BorderSizePixel = 2
+    main.Active = true
+    main.Draggable = true
+    main.Parent = gui
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 22)
+    title.BackgroundColor3 = Color3.fromRGB(214, 178, 93)
+    title.TextColor3 = Color3.fromRGB(20, 29, 42)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 10
+    title.Text = SCRIPT_TITLE .. "  [V32]"
+    title.Parent = main
+
+    local close = Instance.new("TextButton")
+    close.Size = UDim2.fromOffset(19, 17)
+    close.Position = UDim2.new(1, -22, 0, 2)
+    close.BackgroundColor3 = Color3.fromRGB(157, 57, 48)
+    close.TextColor3 = Color3.new(1, 1, 1)
+    close.Text = "X"
+    close.Font = Enum.Font.GothamBold
+    close.TextSize = 10
+    close.Parent = main
+    close.MouseButton1Click:Connect(function()
+        setMainAutoRecovered(false)
+        setInvisibleRecovered(false)
+        gui:Destroy()
+    end)
+
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.new(1, -8, 1, -27)
+    scroll.Position = UDim2.fromOffset(4, 24)
+    scroll.BackgroundTransparency = 1
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 5
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.CanvasSize = UDim2.new()
+    scroll.Parent = main
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 2)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = scroll
+
+    local function makeText(text, height, color)
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, -8, 0, height or 27)
+        label.BackgroundColor3 = color or Color3.fromRGB(27, 51, 80)
+        label.TextColor3 = Color3.fromRGB(235, 239, 244)
+        label.Font = Enum.Font.Gotham
+        label.TextSize = 9
+        label.TextWrapped = true
+        label.Text = text
+        label.Parent = scroll
+        return label
+    end
+
+    local status = makeText("Status: carregado", 22, Color3.fromRGB(33, 62, 92))
+
+    local function setStatus(message, isError)
+        status.Text = "Status: " .. tostring(message)
+        status.TextColor3 = isError and Color3.fromRGB(255, 116, 116)
+            or Color3.fromRGB(150, 236, 174)
+    end
+
+    local function section(text)
+        local label = makeText(text, 19, Color3.fromRGB(38, 64, 91))
+        label.TextColor3 = Color3.fromRGB(243, 203, 105)
+        label.Font = Enum.Font.GothamBold
+        return label
+    end
+
+    local function toggle(text, initial, callback)
+        local enabled = initial and true or false
+        local button = Instance.new("TextButton")
+        button.Size = UDim2.new(1, -8, 0, 21)
+        button.BackgroundColor3 = enabled and Color3.fromRGB(38, 154, 99)
+            or Color3.fromRGB(150, 53, 48)
+        button.TextColor3 = Color3.new(1, 1, 1)
+        button.Font = Enum.Font.GothamBold
+        button.TextSize = 9
+        button.Parent = scroll
+
+        local function render()
+            button.Text = (enabled and "Ligado  " or "Desligado  ") .. text
+            button.BackgroundColor3 = enabled and Color3.fromRGB(38, 154, 99)
+                or Color3.fromRGB(150, 53, 48)
+        end
+        render()
+
+        button.MouseButton1Click:Connect(function()
+            enabled = not enabled
+            render()
+            local ok, err = pcall(callback, enabled, button)
+            if ok then
+                setStatus(text .. (enabled and " ligado" or " desligado"))
+            else
+                enabled = not enabled
+                render()
+                setStatus(err, true)
+            end
+        end)
+        return button
+    end
+
+    local function numberInput(labelText, value, callback)
+        local box = Instance.new("TextBox")
+        box.Size = UDim2.new(1, -8, 0, 32)
+        box.BackgroundColor3 = Color3.fromRGB(10, 25, 43)
+        box.TextColor3 = Color3.fromRGB(236, 236, 236)
+        box.PlaceholderText = labelText
+        box.Text = labelText .. ": " .. tostring(value)
+        box.ClearTextOnFocus = true
+        box.Font = Enum.Font.Code
+        box.TextSize = 13
+        box.Parent = scroll
+        box.FocusLost:Connect(function(enterPressed)
+            local parsed = tonumber(box.Text)
+            if parsed then
+                callback(parsed)
+                box.Text = labelText .. ": " .. tostring(parsed)
+                setStatus(labelText .. " atualizado")
+            else
+                box.Text = labelText .. ": " .. tostring(value)
+                if enterPressed then setStatus("valor inválido", true) end
+            end
+        end)
+        return box
+    end
+
+    section("Auto Farm")
+    toggle("Farm principal", true, function(enabled)
+        setMainAutoRecovered(enabled, {
+            log = function(message) setStatus(message) end,
+            notify = function(message) setStatus(message) end,
+        })
+    end)
+    toggle("Personagem invisível", true, setInvisibleRecovered)
+    makeText("Pula Cidade do Bloco, Robloxia Central e Studville. Farma na posição fixa da Cidade de Robloxia.", 48, Color3.fromRGB(22, 44, 70))
+
+    return gui
+end
+
+-- Retorno auxiliar para inspeção desta reconstrução. A fonte original possivelmente
+-- não retorna esta tabela; isto é apenas para tornar o checkpoint utilizável.
+local RecoveredAPI = {
+    title = SCRIPT_TITLE,
+    config = config,
+    loadConfigRecovered = loadConfigRecovered,
+    saveConfigRecovered = saveConfigRecovered,
+    roundState = roundState,
+    mapDetect = mapDetect,
+    ui = RecoveredUI,
+    getUpgradePriceObject = getUpgradePriceObject,
+    parseDisplayedNumberRecovered = parseDisplayedNumberRecovered,
+    getUpgradeBalanceObjectRecovered = getUpgradeBalanceObjectRecovered,
+    canAffordUpgradeRecovered = canAffordUpgradeRecovered,
+    setAutoUpgradeSize = setAutoUpgradeSize,
+    setAutoUpgradeMultiplier = setAutoUpgradeMultiplier,
+    setAutoUpgradeSpeed = setAutoUpgradeSpeed,
+    setAutoUpgradeEatSpeed = setAutoUpgradeEatSpeed,
+    setAffordabilityCheck = setAffordabilityCheck,
+    setRoundTarget = setRoundTarget,
+    setRoundControl = setRoundControl,
+    clearRoundCount = clearRoundCount,
+    markEnterMega = markEnterMega,
+    shouldPauseSmartTeleport = shouldPauseSmartTeleport,
+    requestMega = requestMega,
+    requestNormal = requestNormal,
+    characterTeleportToMega = characterTeleportToMega,
+    attachCharacter = attachCharacter,
+    fallbackSell = fallbackSell,
+    createFarmPlatformRecovered = createFarmPlatformRecovered,
+    fireFarmRemotesRecovered = fireFarmRemotesRecovered,
+    orbitStateRecovered = orbitStateRecovered,
+    computeOrbitPositionRecovered = computeOrbitPositionRecovered,
+    buildMovementFrameRecovered = buildMovementFrameRecovered,
+    applyRecoveredMovement = applyRecoveredMovement,
+    setCircularMovementRecovered = setCircularMovementRecovered,
+    setFarmPlatformRecovered = setFarmPlatformRecovered,
+    getMovementHeightInputsRecovered = getMovementHeightInputsRecovered,
+    waitForLanding = waitForLanding,
+    markRecognizedSmall = markRecognizedSmall,
+    beginMegaCountdown = beginMegaCountdown,
+    smartTeleportTick = smartTeleportTick,
+    setSmartTeleportRecovered = setSmartTeleportRecovered,
+    setSmartTeleportStandaloneRecovered = setSmartTeleportStandaloneRecovered,
+    renderSmartTeleportCountdownRecovered = renderSmartTeleportCountdownRecovered,
+    startSmallMapRecognitionBootMonitorRecovered = startSmallMapRecognitionBootMonitorRecovered,
+    stopSmallMapRecognitionBootMonitorRecovered = stopSmallMapRecognitionBootMonitorRecovered,
+    setSmallRecognitionStandaloneRecovered = setSmallRecognitionStandaloneRecovered,
+    startSmallMapRecognitionCountdownRecovered = startSmallMapRecognitionCountdownRecovered,
+    sellRecovered = sellRecovered,
+    timedTeleportHeartbeat = timedTeleportHeartbeat,
+    buildStatusTextRecovered = buildStatusTextRecovered,
+    computeDailyIncomeRecovered = computeDailyIncomeRecovered,
+    updateAutoFarmStatusRecovered = updateAutoFarmStatusRecovered,
+    sizeMetricRecovered = sizeMetricRecovered,
+    formatDailyIncomeRecovered = formatDailyIncomeRecovered,
+    splitHMSRecovered = splitHMSRecovered,
+    splitMSRecovered = splitMSRecovered,
+    STATUS_FORMAT_RECOVERED = STATUS_FORMAT_RECOVERED,
+    stuckRespawnHeartbeat = stuckRespawnHeartbeat,
+    teleportRuntime = teleportRuntime,
+    heartbeatRuntime = heartbeatRuntime,
+    whitelistConfig = WHITELIST_CONFIG,
+    checkWhitelistRecovered = checkWhitelistRecovered,
+    readPermissionSwitchesRecovered = readPermissionSwitchesRecovered,
+
+    -- V11: helpers de mapa/skip já ligados aos protótipos recuperados.
+    getCurrentMapNameRecovered = getCurrentMapNameRecovered,
+    notifyDialogRecovered = notifyDialogRecovered,
+    forceSwitchMapRecovered = forceSwitchMapRecovered,
+    normalizeMapNameRecovered = normalizeMapNameRecovered,
+    mapNameMatchesRecovered = mapNameMatchesRecovered,
+    isRobloxiaCityFarmMapRecovered = isRobloxiaCityFarmMapRecovered,
+    specialFarmPositionRuntime = specialFarmPositionRuntime,
+    ROBLOXIA_CITY_FARM_POSITION = ROBLOXIA_CITY_FARM_POSITION,
+    isSkippedFarmMapRecovered = isSkippedFarmMapRecovered,
+    suppressFarmOnSkippedMapRecovered = suppressFarmOnSkippedMapRecovered,
+    hasEnabledSmallMapRecognitionRecovered = hasEnabledSmallMapRecognitionRecovered,
+    isRecognizedSmallMapByNameRecovered = isRecognizedSmallMapByNameRecovered,
+    refreshSmallMapRecognitionRecovered = refreshSmallMapRecognitionRecovered,
+
+    -- V11: estado das três células compartilhadas por proto221/238/184.
+    autoFarmStateRecovered = autoFarmStateRecovered,
+    createAutoFarmStatusGuiRecovered = createAutoFarmStatusGuiRecovered,
+    attachCharacterLifecycleRecovered = attachCharacterLifecycleRecovered,
+    runMainAutoFarmLifecycleRecovered = runMainAutoFarmLifecycleRecovered,
+    setMainAutoRecovered = setMainAutoRecovered,
+    setInvisibleRecovered = setInvisibleRecovered,
+    autoClaimRewardsLoopRecovered = autoClaimRewardsLoopRecovered,
+    claimTimedRewardsPassRecovered = claimTimedRewardsPassRecovered,
+    autoCollectCubesLoopRecovered = autoCollectCubesLoopRecovered,
+    collectOwnedCubesPassRecovered = collectOwnedCubesPassRecovered,
+    getAutoFarmFlagsRecovered = getAutoFarmFlagsRecovered,
+    setAutoFarmFlagsRecovered = setAutoFarmFlagsRecovered,
+    applyMainAutoToggleStateRecovered = applyMainAutoToggleStateRecovered,
+    delayedEnableAutoFarmStateRecovered = delayedEnableAutoFarmStateRecovered,
+    clearAutoFarmStateRecovered = clearAutoFarmStateRecovered,
+    createRecoveredMainGui = createRecoveredMainGui,
+}
+
+-- O original faz a checagem antes de abrir a interface. A lista local editável
+-- tem prioridade, portanto o dono configurado não depende da resposta HTTP.
+task.spawn(function()
+    local ok, reason = checkWhitelistRecovered()
+    if ok then
+        local guiOk, guiError = pcall(createRecoveredMainGui)
+        if not guiOk then
+            warn("[ETW V26] falha ao criar GUI: " .. tostring(guiError))
+        else
+            setInvisibleRecovered(true)
+            setMainAutoRecovered(true)
+            startMapCycleRecovered()
+        end
+    else
+        notifyDialogRecovered("Acesso negado", reason or "Você não está na whitelist", 8)
+    end
+end)
+
+return RecoveredAPI
