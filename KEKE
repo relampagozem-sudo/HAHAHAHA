@@ -3140,14 +3140,18 @@ local function startMapCycleRecovered()
                         end
                     end
                 elseif state == "waitingMega" then
-                    if mega == true or now - since >= 5 then
+                    if mega == true then
                         state, since, emptySince, sawBoxes = "mega", now, nil, false
+                    elseif now - since >= 10 then
+                        -- Só inicia os 90 minutos quando o Mega aparecer de fato.
+                        state, since = "normal", now - 23
                     end
                 elseif state == "mega" then
-                    if hasOwnedBoxesRecovered() then
-                        sawBoxes, emptySince = true, nil
-                    elseif now - since >= 30 then
+                    -- O limite de tempo vale mesmo quando ainda existem caixas.
+                    if now - since >= 5400 then
                         state, lastRequest = "returning", 0
+                    elseif hasOwnedBoxesRecovered() then
+                        sawBoxes, emptySince = true, nil
                     end
                 elseif state == "draining" then
                     if hasOwnedBoxesRecovered() then
@@ -3166,8 +3170,11 @@ local function startMapCycleRecovered()
                         end
                     end
                 elseif state == "waitingNormal" then
-                    if (mega == false and now - since >= 2) or now - since >= 5 then
+                    if mega == false then
                         state, since, emptySince, sawBoxes = "normal", now, nil, false
+                    elseif now - since >= 10 then
+                        -- Pedido sem troca confirmada: tentar novamente.
+                        state, lastRequest = "returning", 0
                     end
                 end
             end
