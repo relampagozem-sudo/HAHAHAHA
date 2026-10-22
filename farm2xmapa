@@ -976,6 +976,11 @@ local chunkRuntimeRecovered = {
     -- a segunda libera a troca normal de mapa.
     farmPass = 1,
     secondPointHasEaten = false,
+    secondPointChunks = 0,
+    secondPointSawReset = false,
+    sellStartedAt = nil,
+    lastSellAttemptAt = nil,
+    sellTransitionScheduled = false,
     lastMapKey = "",
     mapRevision = 0,
 }
@@ -994,10 +999,15 @@ local function syncFarmPassWithCurrentMapRecovered(mapName)
         and chunkRuntimeRecovered.lastMapKey ~= key then
         chunkRuntimeRecovered.farmPass = 1
         chunkRuntimeRecovered.secondPointHasEaten = false
+        chunkRuntimeRecovered.secondPointChunks = 0
+        chunkRuntimeRecovered.secondPointSawReset = false
         chunkRuntimeRecovered.total = 0
         chunkRuntimeRecovered.previousActive = false
         chunkRuntimeRecovered.noChunkSeconds = 0
         chunkRuntimeRecovered.sellDebounce = false
+        chunkRuntimeRecovered.sellStartedAt = nil
+        chunkRuntimeRecovered.lastSellAttemptAt = nil
+        chunkRuntimeRecovered.sellTransitionScheduled = false
         chunkRuntimeRecovered.mapRevision += 1
     end
 
@@ -2648,6 +2658,7 @@ local function updateChunkCounterRecovered(currentChunk, dt)
         chunkRuntimeRecovered.total += 1
         if chunkRuntimeRecovered.farmPass == 2 then
             chunkRuntimeRecovered.secondPointHasEaten = true
+            chunkRuntimeRecovered.secondPointChunks += 1
         end
     end
     chunkRuntimeRecovered.previousActive = active
@@ -2678,8 +2689,13 @@ local function finishSellTransitionRecovered(delaySeconds, expectedMapRevision)
         chunkRuntimeRecovered.previousActive = false
         chunkRuntimeRecovered.noChunkSeconds = 0
         chunkRuntimeRecovered.secondPointHasEaten = false
+        chunkRuntimeRecovered.secondPointChunks = 0
+        chunkRuntimeRecovered.secondPointSawReset = false
         skipState58 = false
         chunkRuntimeRecovered.sellDebounce = false
+        chunkRuntimeRecovered.sellStartedAt = nil
+        chunkRuntimeRecovered.lastSellAttemptAt = nil
+        chunkRuntimeRecovered.sellTransitionScheduled = false
         return
     end
 
@@ -2700,7 +2716,12 @@ local function finishSellTransitionRecovered(delaySeconds, expectedMapRevision)
     specialFarmPositionRuntime.z = nil
     chunkRuntimeRecovered.farmPass = 1
     chunkRuntimeRecovered.secondPointHasEaten = false
+    chunkRuntimeRecovered.secondPointChunks = 0
+    chunkRuntimeRecovered.secondPointSawReset = false
     chunkRuntimeRecovered.sellDebounce = false
+    chunkRuntimeRecovered.sellStartedAt = nil
+    chunkRuntimeRecovered.lastSellAttemptAt = nil
+    chunkRuntimeRecovered.sellTransitionScheduled = false
 end
 
 local function processAutoSellRecovered(bindings)
@@ -2715,21 +2736,48 @@ local function processAutoSellRecovered(bindings)
     local noChunkSeconds = chunkRuntimeRecovered.noChunkSeconds
     -- Proto133 PCs 497–498/593–595: MaxSize <= Size + 2.
     local capacityReached = maxSize <= currentSize + 2
-    if not capacityReached and noChunkSeconds <= 12 then
-        return false
-    end
-
-    -- Depois da primeira venda, só permite vender de novo quando ao menos
-    -- um bloco foi realmente consumido no Ponto 2.
-    if chunkRuntimeRecovered.farmPass == 2
-        and not chunkRuntimeRecovered.secondPointHasEaten then
-        return false
-    end
-
-    -- Uma venda por vez: o Heartbeat não pode reenviar Sell enquanto o
-    -- servidor ainda processa a venda anterior.
+    -- Uma venda só é concluída depois que o tamanho realmente cai. Enquanto o
+    -- servidor ainda mostra o tamanho máximo, repete Sell em intervalos curtos
+    -- para não ficar esperando uma chamada perdida, mas nunca muda de ponto
+    -- nem de mapa com a venda pendente.
     if chunkRuntimeRecovered.sellDebounce then
+        local resetMargin = math.max(10, maxSize * 0.01)
+        local saleWasProcessed = currentSize < (maxSize - resetMargin)
+        if not saleWasProcessed then
+            local now = tick()
+            if not chunkRuntimeRecovered.lastSellAttemptAt
+                or now - chunkRuntimeRecovered.lastSellAttemptAt >= 0.5 then
+                pcall(function() bindings.Sell:FireServer() end)
+                chunkRuntimeRecovered.lastSellAttemptAt = now
+            end
+            return true
+        end
+
+        if not chunkRuntimeRecovered.sellTransitionScheduled then
+            chunkRuntimeRecovered.sellTransitionScheduled = true
+            local expectedMapRevision = chunkRuntimeRecovered.mapRevision
+            -- Dois segundos dão tempo de o servidor terminar a venda antes de
+            -- mover o boneco para o outro ponto ou para o próximo mapa.
+            task.spawn(finishSellTransitionRecovered, 2, expectedMapRevision)
+        end
         return true
+    end
+
+    if chunkRuntimeRecovered.farmPass == 2 then
+        -- O tamanho baixo confirma que a primeira venda terminou antes de
+        -- permitir qualquer nova venda no Ponto 2.
+        if currentSize < (maxSize - math.max(10, maxSize * 0.01)) then
+            chunkRuntimeRecovered.secondPointSawReset = true
+        end
+        -- Um único bloco não basta: evita sair do Ponto 2 por tamanho máximo
+        -- antigo ou por uma colisão logo ao chegar.
+        if not chunkRuntimeRecovered.secondPointSawReset
+            or chunkRuntimeRecovered.secondPointChunks < 8
+            or not capacityReached then
+            return false
+        end
+    elseif not capacityReached and noChunkSeconds <= 12 then
+        return false
     end
 
     -- Proto149 (capacidade) e proto166 (timeout) chamam o mesmo Sell sem args.
@@ -2737,9 +2785,9 @@ local function processAutoSellRecovered(bindings)
     chunkRuntimeRecovered.total = 0
 
     chunkRuntimeRecovered.sellDebounce = true
-    local delaySeconds = noChunkSeconds < 12 and 8 or 3
-    local expectedMapRevision = chunkRuntimeRecovered.mapRevision
-    task.spawn(finishSellTransitionRecovered, delaySeconds, expectedMapRevision)
+    chunkRuntimeRecovered.sellStartedAt = tick()
+    chunkRuntimeRecovered.lastSellAttemptAt = chunkRuntimeRecovered.sellStartedAt
+    chunkRuntimeRecovered.sellTransitionScheduled = false
     return true
 end
 
