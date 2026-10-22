@@ -2531,43 +2531,6 @@ local function buildMovementFrameRecovered(x, y, z)
         * CFrame.Angles(0, math.atan2(x, z) + math.pi, 0)
 end
 
--- A escala visual do jogo pode aumentar sem atualizar o tamanho do RootPart.
--- Usamos somente as partes do corpo para localizar os pés. A caixa completa
--- (GetBoundingBox) inclui asas, correntes e acessórios, que faziam o boneco
--- ficar alto demais no ar.
-local function getSafeFarmHeightRecovered(bindings, platformTopY)
-    local root = bindings and bindings.root
-    local humanoid = bindings and bindings.humanoid
-    if not root then return platformTopY + 5 end
-
-    local character = root.Parent
-    if character and character:IsA("Model") then
-        local bodyPartNames = {
-            ["HumanoidRootPart"] = true,
-            ["UpperTorso"] = true, ["LowerTorso"] = true, ["Torso"] = true,
-            ["LeftUpperLeg"] = true, ["LeftLowerLeg"] = true, ["LeftFoot"] = true,
-            ["RightUpperLeg"] = true, ["RightLowerLeg"] = true, ["RightFoot"] = true,
-            ["Left Leg"] = true, ["Right Leg"] = true,
-        }
-        local lowestBodyY = nil
-        for _, child in ipairs(character:GetChildren()) do
-            if child:IsA("BasePart") and bodyPartNames[child.Name] then
-                local partBottomY = child.Position.Y - (child.Size.Y / 2)
-                lowestBodyY = lowestBodyY and math.min(lowestBodyY, partBottomY) or partBottomY
-            end
-        end
-        if lowestBodyY then
-            local bodyBottomOffset = lowestBodyY - root.Position.Y
-            return platformTopY + 2 - bodyBottomOffset
-        end
-    end
-
-    return platformTopY
-        + (humanoid and humanoid.HipHeight or 0)
-        + (root.Size.Y / 2)
-        + 5
-end
-
 local function applyRecoveredMovement(bindings, farmPlatform, dt)
     if not bindings or not bindings.root or not bindings.humanoid then return false end
 
@@ -2575,8 +2538,7 @@ local function applyRecoveredMovement(bindings, farmPlatform, dt)
     if farmPlatform then
         baseY = farmPlatform.Position.Y + (farmPlatform.Size.Y / 2)
     end
-    local minimumY = getSafeFarmHeightRecovered(bindings, baseY)
-    local y = minimumY
+    local y = baseY + bindings.humanoid.HipHeight + (bindings.root.Size.Y / 2) + 5
 
     -- Com U37/R42=false, o original escolhe um dos dois pares fixos. Esse é
     -- o modo normal de comer parado mostrado pelo usuário.
@@ -2620,7 +2582,6 @@ local function applyRecoveredMovement(bindings, farmPlatform, dt)
                 mode = "fixed-farm-position-" .. tostring(chunkRuntimeRecovered.farmPass)
             end
         end
-        y = math.max(y, minimumY)
         local targetFrame = CFrame.new(x, y, z)
         if yaw ~= nil then
             targetFrame = targetFrame * CFrame.Angles(0, math.rad(yaw), 0)
