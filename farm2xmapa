@@ -975,45 +975,7 @@ local chunkRuntimeRecovered = {
     -- Cada mapa é usado em dois pontos. A primeira venda troca de ponto;
     -- a segunda libera a troca normal de mapa.
     farmPass = 1,
-    secondPointHasEaten = false,
-    secondPointChunks = 0,
-    secondPointSawReset = false,
-    sellStartedAt = nil,
-    lastSellAttemptAt = nil,
-    sellTransitionScheduled = false,
-    lastMapKey = "",
-    mapRevision = 0,
 }
-
--- Trocas disparadas por skip/reconhecimento não passam necessariamente pela
--- venda. Sempre que o mapa muda, o novo mapa tem de começar no Ponto 1.
-local function syncFarmPassWithCurrentMapRecovered(mapName)
-    local key = normalizeMapNameRecovered(mapName)
-    if key == "" then return false end
-
-    if isRobloxiaCityFarmMapRecovered(mapName) then
-        key = "robloxia-city"
-    end
-
-    if chunkRuntimeRecovered.lastMapKey ~= ""
-        and chunkRuntimeRecovered.lastMapKey ~= key then
-        chunkRuntimeRecovered.farmPass = 1
-        chunkRuntimeRecovered.secondPointHasEaten = false
-        chunkRuntimeRecovered.secondPointChunks = 0
-        chunkRuntimeRecovered.secondPointSawReset = false
-        chunkRuntimeRecovered.total = 0
-        chunkRuntimeRecovered.previousActive = false
-        chunkRuntimeRecovered.noChunkSeconds = 0
-        chunkRuntimeRecovered.sellDebounce = false
-        chunkRuntimeRecovered.sellStartedAt = nil
-        chunkRuntimeRecovered.lastSellAttemptAt = nil
-        chunkRuntimeRecovered.sellTransitionScheduled = false
-        chunkRuntimeRecovered.mapRevision += 1
-    end
-
-    chunkRuntimeRecovered.lastMapKey = key
-    return true
-end
 
 local teleportRuntime = {
     lastClock = nil,
@@ -2563,7 +2525,6 @@ local function applyRecoveredMovement(bindings, farmPlatform, dt)
             mode = "timed-teleport"
         else
             local mapName = getCurrentMapNameRecovered()
-            syncFarmPassWithCurrentMapRecovered(mapName)
             local secondPoint = chunkRuntimeRecovered.farmPass == 2
                 and getSecondFarmPointForMapRecovered(mapName)
 
@@ -2656,10 +2617,6 @@ local function updateChunkCounterRecovered(currentChunk, dt)
 
     if active and not chunkRuntimeRecovered.previousActive then
         chunkRuntimeRecovered.total += 1
-        if chunkRuntimeRecovered.farmPass == 2 then
-            chunkRuntimeRecovered.secondPointHasEaten = true
-            chunkRuntimeRecovered.secondPointChunks += 1
-        end
     end
     chunkRuntimeRecovered.previousActive = active
 
@@ -2672,15 +2629,8 @@ local function updateChunkCounterRecovered(currentChunk, dt)
     return chunkRuntimeRecovered.total, chunkRuntimeRecovered.noChunkSeconds
 end
 
-local function finishSellTransitionRecovered(delaySeconds, expectedMapRevision)
+local function finishSellTransitionRecovered(delaySeconds)
     task.wait(delaySeconds)
-    -- Se o mapa trocou enquanto a venda estava pendente, esta transição é de
-    -- um mapa antigo e não pode liberar o Ponto 2 no mapa novo.
-    if expectedMapRevision ~= nil
-        and expectedMapRevision ~= chunkRuntimeRecovered.mapRevision then
-        return
-    end
-
     -- A primeira venda não troca mais o mapa: o boneco volta pequeno e vai
     -- para o segundo ponto, onde ainda há blocos que ele consegue alcançar.
     if chunkRuntimeRecovered.farmPass == 1 then
@@ -2688,14 +2638,8 @@ local function finishSellTransitionRecovered(delaySeconds, expectedMapRevision)
         chunkRuntimeRecovered.total = 0
         chunkRuntimeRecovered.previousActive = false
         chunkRuntimeRecovered.noChunkSeconds = 0
-        chunkRuntimeRecovered.secondPointHasEaten = false
-        chunkRuntimeRecovered.secondPointChunks = 0
-        chunkRuntimeRecovered.secondPointSawReset = false
         skipState58 = false
         chunkRuntimeRecovered.sellDebounce = false
-        chunkRuntimeRecovered.sellStartedAt = nil
-        chunkRuntimeRecovered.lastSellAttemptAt = nil
-        chunkRuntimeRecovered.sellTransitionScheduled = false
         return
     end
 
@@ -2715,13 +2659,7 @@ local function finishSellTransitionRecovered(delaySeconds, expectedMapRevision)
     specialFarmPositionRuntime.x = nil
     specialFarmPositionRuntime.z = nil
     chunkRuntimeRecovered.farmPass = 1
-    chunkRuntimeRecovered.secondPointHasEaten = false
-    chunkRuntimeRecovered.secondPointChunks = 0
-    chunkRuntimeRecovered.secondPointSawReset = false
     chunkRuntimeRecovered.sellDebounce = false
-    chunkRuntimeRecovered.sellStartedAt = nil
-    chunkRuntimeRecovered.lastSellAttemptAt = nil
-    chunkRuntimeRecovered.sellTransitionScheduled = false
 end
 
 local function processAutoSellRecovered(bindings)
@@ -2736,47 +2674,7 @@ local function processAutoSellRecovered(bindings)
     local noChunkSeconds = chunkRuntimeRecovered.noChunkSeconds
     -- Proto133 PCs 497–498/593–595: MaxSize <= Size + 2.
     local capacityReached = maxSize <= currentSize + 2
-    -- Uma venda só é concluída depois que o tamanho realmente cai. Enquanto o
-    -- servidor ainda mostra o tamanho máximo, repete Sell em intervalos curtos
-    -- para não ficar esperando uma chamada perdida, mas nunca muda de ponto
-    -- nem de mapa com a venda pendente.
-    if chunkRuntimeRecovered.sellDebounce then
-        local resetMargin = math.max(10, maxSize * 0.01)
-        local saleWasProcessed = currentSize < (maxSize - resetMargin)
-        if not saleWasProcessed then
-            local now = tick()
-            if not chunkRuntimeRecovered.lastSellAttemptAt
-                or now - chunkRuntimeRecovered.lastSellAttemptAt >= 0.5 then
-                pcall(function() bindings.Sell:FireServer() end)
-                chunkRuntimeRecovered.lastSellAttemptAt = now
-            end
-            return true
-        end
-
-        if not chunkRuntimeRecovered.sellTransitionScheduled then
-            chunkRuntimeRecovered.sellTransitionScheduled = true
-            local expectedMapRevision = chunkRuntimeRecovered.mapRevision
-            -- Dois segundos dão tempo de o servidor terminar a venda antes de
-            -- mover o boneco para o outro ponto ou para o próximo mapa.
-            task.spawn(finishSellTransitionRecovered, 2, expectedMapRevision)
-        end
-        return true
-    end
-
-    if chunkRuntimeRecovered.farmPass == 2 then
-        -- O tamanho baixo confirma que a primeira venda terminou antes de
-        -- permitir qualquer nova venda no Ponto 2.
-        if currentSize < (maxSize - math.max(10, maxSize * 0.01)) then
-            chunkRuntimeRecovered.secondPointSawReset = true
-        end
-        -- Um único bloco não basta: evita sair do Ponto 2 por tamanho máximo
-        -- antigo ou por uma colisão logo ao chegar.
-        if not chunkRuntimeRecovered.secondPointSawReset
-            or chunkRuntimeRecovered.secondPointChunks < 8
-            or not capacityReached then
-            return false
-        end
-    elseif not capacityReached and noChunkSeconds <= 12 then
+    if not capacityReached and noChunkSeconds <= 12 then
         return false
     end
 
@@ -2784,10 +2682,11 @@ local function processAutoSellRecovered(bindings)
     pcall(function() bindings.Sell:FireServer() end)
     chunkRuntimeRecovered.total = 0
 
-    chunkRuntimeRecovered.sellDebounce = true
-    chunkRuntimeRecovered.sellStartedAt = tick()
-    chunkRuntimeRecovered.lastSellAttemptAt = chunkRuntimeRecovered.sellStartedAt
-    chunkRuntimeRecovered.sellTransitionScheduled = false
+    if not chunkRuntimeRecovered.sellDebounce then
+        chunkRuntimeRecovered.sellDebounce = true
+        local delaySeconds = noChunkSeconds < 12 and 8 or 3
+        task.spawn(finishSellTransitionRecovered, delaySeconds)
+    end
     return true
 end
 
@@ -3773,4 +3672,4 @@ task.spawn(function()
     end
 end)
 
-return RecoveredAPI
+return RecoveredA
