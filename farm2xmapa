@@ -2532,8 +2532,9 @@ local function buildMovementFrameRecovered(x, y, z)
 end
 
 -- A escala visual do jogo pode aumentar sem atualizar o tamanho do RootPart.
--- Calculamos a distância real entre o RootPart e a base da caixa do personagem
--- para manter os pés acima da plataforma mesmo quando ele fica gigante.
+-- Usamos somente as partes do corpo para localizar os pés. A caixa completa
+-- (GetBoundingBox) inclui asas, correntes e acessórios, que faziam o boneco
+-- ficar alto demais no ar.
 local function getSafeFarmHeightRecovered(bindings, platformTopY)
     local root = bindings and bindings.root
     local humanoid = bindings and bindings.humanoid
@@ -2541,12 +2542,23 @@ local function getSafeFarmHeightRecovered(bindings, platformTopY)
 
     local character = root.Parent
     if character and character:IsA("Model") then
-        local ok, boxFrame, boxSize = pcall(function()
-            return character:GetBoundingBox()
-        end)
-        if ok and boxFrame and boxSize and boxSize.Y > 0 then
-            local bottomOffset = (boxFrame.Position.Y - root.Position.Y) - (boxSize.Y / 2)
-            return platformTopY + 2 - bottomOffset
+        local bodyPartNames = {
+            ["HumanoidRootPart"] = true,
+            ["UpperTorso"] = true, ["LowerTorso"] = true, ["Torso"] = true,
+            ["LeftUpperLeg"] = true, ["LeftLowerLeg"] = true, ["LeftFoot"] = true,
+            ["RightUpperLeg"] = true, ["RightLowerLeg"] = true, ["RightFoot"] = true,
+            ["Left Leg"] = true, ["Right Leg"] = true,
+        }
+        local lowestBodyY = nil
+        for _, child in ipairs(character:GetChildren()) do
+            if child:IsA("BasePart") and bodyPartNames[child.Name] then
+                local partBottomY = child.Position.Y - (child.Size.Y / 2)
+                lowestBodyY = lowestBodyY and math.min(lowestBodyY, partBottomY) or partBottomY
+            end
+        end
+        if lowestBodyY then
+            local bodyBottomOffset = lowestBodyY - root.Position.Y
+            return platformTopY + 2 - bodyBottomOffset
         end
     end
 
