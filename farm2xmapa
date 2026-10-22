@@ -2530,7 +2530,6 @@ local function applyRecoveredMovement(bindings, farmPlatform, dt)
 
             if secondPoint then
                 x = secondPoint.x
-                y = secondPoint.y
                 z = secondPoint.z
                 yaw = secondPoint.yaw
                 mode = "saved-farm-position-2"
@@ -2539,7 +2538,6 @@ local function applyRecoveredMovement(bindings, farmPlatform, dt)
                 specialFarmPositionRuntime.x = ROBLOXIA_CITY_FARM_POSITION.X
                 specialFarmPositionRuntime.z = ROBLOXIA_CITY_FARM_POSITION.Z
                 x = ROBLOXIA_CITY_FARM_POSITION.X
-                y = ROBLOXIA_CITY_FARM_POSITION.Y
                 z = ROBLOXIA_CITY_FARM_POSITION.Z
                 mode = "robloxia-city-fixed-position"
             else
